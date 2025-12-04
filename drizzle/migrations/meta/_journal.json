@@ -1,0 +1,20 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1758969992857,
+      "tag": "0000_regular_fabian_cortez",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1758984176872,
+      "tag": "0001_slippery_the_anarchist",
+      "breakpoints": true
+    }
+  ]
+}

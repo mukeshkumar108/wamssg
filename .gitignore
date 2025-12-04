@@ -1,0 +1,53 @@
+# Dependencies
+node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment variables
+.env
+.env.local
+.env.production
+
+# WhatsApp Web sessions (contains auth tokens)
+.wwebjs_auth
+.wwebjs_cache
+
+# Build outputs
+dist
+build
+
+# SQLite databases (user data, not source code)
+*.db
+*.sqlite
+*.sqlite3
+out/messages.db
+
+# Raw data logs (large files, not needed in repo)
+out
+out/*.jsonl
+out/*.log
+out/*.db
+
+# Keep these monitoring files (important for production)
+out/service.log
+out/status.json
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE files
+.vscode/settings.json
+.idea
+*.swp
+*.swo
+
+# Temporary files
+*.tmp
+*.temp
