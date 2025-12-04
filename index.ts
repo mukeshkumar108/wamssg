@@ -148,7 +148,6 @@ interface CallState {
 }
 
 const activeCalls = new Map<string, CallState>();
-const CALL_CACHE_TTL = 60 * 60 * 1000; // 1 hour (calls don't last longer than this)
 
 /* ===========================
    QR and HTTP server
@@ -437,10 +436,17 @@ function startHTTPServer() {
   return app;
 }
 
+let contactApiBroken = false;
+const contactErrorSeenForId = new Set<string>();
+
 async function resolveContactName(
   id: string,
-  sourceMessage?: Message
+  sourceMessage?: Message,
+  chat?: Chat
 ): Promise<{ displayName: string; savedName: string | null; pushname: string | null }> {
+  let savedName: string | null = null;
+  let finalPushname: string | null = null;
+
   if (id === 'me') {
     return { displayName: 'me', savedName: null, pushname: null };
   }
@@ -454,39 +460,84 @@ async function resolveContactName(
     };
   }
 
-  try {
-    const contact =
-      (sourceMessage && typeof (sourceMessage as any).getContact === 'function'
-        ? await (sourceMessage as any).getContact()
-        : null) ?? (await client.getContactById(id));
+  const raw = (sourceMessage as any)?._data ?? {};
+  const notifyName = raw.notifyName as string | undefined;
+  const msgPushname = raw.pushname as string | undefined;
 
-    const savedName = contact.name ?? null;
-    const pushname = contact.pushname ?? null;
-    const displayName =
-      contact.name ||
-      contact.pushname ||
-      (contact as any).shortName ||
-      (contact as any).number ||
-      contact.id?._serialized ||
-      id;
+    // Prefer chat name (for 1:1 chats this is often the contact name)
+  const chatName =
+    chat
+      ? (
+          chat.name ||
+          (chat as any).formattedTitle ||
+          undefined
+        )
+      : undefined;
 
-    const result = { displayName, savedName, pushname };
-    contactCache.set(id, { ...result, timestamp: Date.now() });
+  let baseDisplay =
+    chat && chatName && chatName !== chat.id?._serialized
+      ? chatName
+      : undefined;
 
-    return result;
-  } catch (err: any) {
-    console.warn('⚠️ Contact lookup failed; using ID fallback', {
-      contactId: id,
-      message: err?.message
-    });
-    return { displayName: id, savedName: null, pushname: null };
+  baseDisplay = baseDisplay || notifyName || msgPushname || id;
+
+
+  // 🔹 Try the contact API *once* per process, unless we've already marked it as broken
+  if (!contactApiBroken) {
+    try {
+      const contact =
+        sourceMessage && typeof (sourceMessage as any).getContact === 'function'
+          ? await (sourceMessage as any).getContact()
+          : await client.getContactById(id);
+
+      savedName = contact.name ?? null;
+      finalPushname = contact.pushname ?? finalPushname;
+
+      const upgradedDisplay =
+        contact.name ||
+        contact.pushname ||
+        baseDisplay;
+
+      const result = {
+        displayName: upgradedDisplay,
+        savedName,
+        pushname: finalPushname
+      };
+
+      contactCache.set(id, { ...result, timestamp: Date.now() });
+      return result;
+    } catch (err: any) {
+      const msg = err?.message || '';
+
+      // If WhatsApp internals changed (ContactMethods.*), treat contact API as broken for this process
+      if (msg.includes('ContactMethods.getIsMyContact')) {
+        contactApiBroken = true;
+      }
+
+      if (!contactErrorSeenForId.has(id)) {
+        contactErrorSeenForId.add(id);
+        console.warn('⚠️ Contact lookup failed; falling back to chat/message metadata', {
+          contactId: id,
+          message: msg
+        });
+      }
+      // Fall through to base metadata
+    }
   }
+
+  const fallbackResult = {
+    displayName: baseDisplay,
+    savedName,
+    pushname: finalPushname
+  };
+
+  contactCache.set(id, { ...fallbackResult, timestamp: Date.now() });
+  return fallbackResult;
 }
 
 /* ===========================
    Name resolution
 =========================== */
-type ContactLike = { pushname?: string | null; name?: string | null };
 
 function resolvedChatName(chat: Chat): string {
   return (
@@ -503,7 +554,7 @@ function resolvedChatName(chat: Chat): string {
 async function saveMessage(m: Message, chat: Chat) {
   const senderId = m.fromMe ? 'me' : (m.author || m.from || chat.id._serialized);
 
-  const resolvedNames = await resolveContactName(senderId, m);
+  const resolvedNames = await resolveContactName(senderId, m, chat);
   const savedName = resolvedNames.savedName;
   const pushname = resolvedNames.pushname;
 
@@ -513,6 +564,13 @@ async function saveMessage(m: Message, chat: Chat) {
   let displayName = chatName || notifyName || senderId;
   if (savedName && savedName !== senderId) {
     displayName = savedName;
+  } else if (resolvedNames.displayName && resolvedNames.displayName !== senderId) {
+    // Next: whatever resolveContactName thought was best
+    displayName = resolvedNames.displayName;
+  } else if (chatName) {
+    displayName = chatName;
+  } else if (notifyName) {
+    displayName = notifyName;
   }
 
   let participantId: string | null = null;

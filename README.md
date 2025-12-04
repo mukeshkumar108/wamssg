@@ -1,8 +1,8 @@
 # WhatsApp Get 📲
 
-A **production-ready** background WhatsApp message ingestion service built with [whatsapp-web.js](https://github.com/pedroslopez/whatsapp-web.js) + [Drizzle ORM](https://orm.drizzle.team).
+A **production-ready** background WhatsApp message ingestion service built with [whatsapp-web.js](https://github.com/pedroslopez/whatsapp-web.js) + a lightweight JSON-backed datastore.
 
-Runs headlessly 24/7, captures all messages/chats/contacts/reactions, and saves them to SQLite with comprehensive error handling and monitoring.
+Runs headlessly 24/7, captures all messages/chats/contacts/reactions, and saves them to JSON files with comprehensive error handling and monitoring.
 
 ---
 
@@ -12,7 +12,7 @@ Runs headlessly 24/7, captures all messages/chats/contacts/reactions, and saves 
 - ✅ **Persistent Authentication**: LocalAuth stores session (QR scan only once)
 - ✅ **Complete Message Capture**: All messages, contacts, group participants, and reactions
 - ✅ **Rich Metadata**: Saved names, display names, media info (mimetype, filename, size, duration)
-- ✅ **SQLite Database**: Portable with Drizzle migrations and comprehensive schema
+- ✅ **JSON Storage**: Portable JSON files in `out/` for messages, contacts, chats, and calls
 - ✅ **Raw JSONL Backup**: Debug-friendly message dump for troubleshooting
 
 ### **Production Features**
@@ -33,19 +33,14 @@ Runs headlessly 24/7, captures all messages/chats/contacts/reactions, and saves 
 
 ## 📊 Output Structure
 
-Messages are written to:
-- **Database** → `out/messages.db` (SQLite with tables: chats, contacts, messages, reactions)
+All data lives in `out/`:
+- **Messages** → `out/messages.json` (JSON map keyed by message ID)
+- **Contacts** → `out/contacts.json`
+- **Chats** → `out/chats.json`
+- **Calls** → `out/calls.json`
+- **Raw Debug Log** → `out/raw.jsonl` (append-only JSONL)
 - **Service Logs** → `out/service.log` (rotated, max 10MB, 3 backups)
 - **Status Monitor** → `out/status.json` (real-time service health)
-- **Debug Log** → `out/raw.jsonl` (raw message dump for troubleshooting)
-
-### **Database Schema**
-```sql
-chats: id, name, isGroup, archived
-contacts: id, savedName, displayName, pushname
-messages: id, chatId, senderId, participantId, body, media metadata, reactions
-reactions: id, messageId, emoji, senderId
-```
 
 ---
 
@@ -87,9 +82,8 @@ git clone https://github.com/<your-username>/whatsapp-get.git
 cd whatsapp-get
 npm install
 
-# Setup database
-npx drizzle-kit generate
-npx drizzle-kit migrate
+# (Optional) Bootstrap JSON DB files
+npm run migrate
 
 # Run the service
 npx ts-node index.ts
@@ -193,7 +187,7 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --only=production
 COPY . .
-RUN npx drizzle-kit generate && npx drizzle-kit migrate
+RUN mkdir -p out
 CMD ["npx", "ts-node", "index.ts"]
 ```
 
@@ -270,10 +264,10 @@ npx ts-node index.ts
 
 ### **Database Issues**
 ```bash
-# Reset database
-rm -f out/messages.db
-npx drizzle-kit generate
-npx drizzle-kit migrate
+# Reset JSON data
+rm -f out/messages.json out/contacts.json out/chats.json out/calls.json out/raw.jsonl
+# Recreate empty files (optional)
+npm run migrate
 ```
 
 ### **Service Won't Start**
@@ -306,7 +300,7 @@ export BASE_RETRY_MS=10000
 ## 📊 Performance Characteristics
 
 - **Memory**: ~50-100MB RAM (depends on message volume)
-- **Storage**: ~1MB per 1000 messages in database
+- **Storage**: ~1MB per 1000 messages in JSON files
 - **Network**: Minimal after initial bootstrap
 - **CPU**: Low during normal operation, higher during backfill
 - **Startup**: 15-30 seconds for initial bootstrap
@@ -318,7 +312,7 @@ export BASE_RETRY_MS=10000
 - **Local Storage**: All data stored locally, never transmitted
 - **No External APIs**: Only connects to WhatsApp Web
 - **Session Security**: WhatsApp Web session stored locally only
-- **Data Privacy**: Messages stored in plain SQLite for easy access
+- **Data Privacy**: Messages stored in plain JSON for easy access
 
 ---
 
@@ -345,9 +339,9 @@ ISC License - see LICENSE file for details.
 │                    WHATSAPP GET SERVICE                         │
 ├─────────────────────────────────────────────────────────────────┤
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │
-│  │  WhatsApp   │  │   SQLite    │  │   HTTP      │              │
-│  │  Web.js     │◄►│  Database   │◄►│   Server    │              │
-│  │  Client     │  │  (Drizzle)  │  │  (Express)  │              │
+│  │  WhatsApp   │  │    JSON     │  │   HTTP      │              │
+│  │  Web.js     │◄►│  Storage    │◄►│   Server    │              │
+│  │  Client     │  │ (out/*.json)│  │  (Express)  │              │
 │  └─────────────┘  └─────────────┘  └─────────────┘              │
 ├─────────────────────────────────────────────────────────────────┤
 │  🎯 CAPABILITIES:                                               │
@@ -376,7 +370,7 @@ ISC License - see LICENSE file for details.
 ## ❓ FAQ - Frequently Asked Questions
 
 ### **🤔 What is this service?**
-WhatsApp Get is a smart background service that automatically captures and stores all your WhatsApp messages, calls, contacts, and reactions in a local SQLite database. Think of it as a personal WhatsApp archive that runs 24/7.
+WhatsApp Get is a smart background service that automatically captures and stores all your WhatsApp messages, calls, contacts, and reactions in a local JSON datastore (`out/*.json`). Think of it as a personal WhatsApp archive that runs 24/7.
 
 ### **🔒 Is this safe and private?**
 - ✅ **Local Storage Only**: All data stays on your computer
@@ -393,7 +387,7 @@ WhatsApp Get is a smart background service that automatically captures and store
 
 ### **💻 How do I get started?**
 1. **Install**: `npm install`
-2. **Setup Database**: `npx drizzle-kit generate && npx drizzle-kit migrate`
+2. **(Optional) Initialize data files**: `npm run migrate`
 3. **Run**: `npx ts-node index.ts`
 4. **Scan QR**: Open WhatsApp → Settings → Linked Devices → Link a Device
 5. **Done!** Service runs in background capturing messages
@@ -423,7 +417,7 @@ curl -H "Authorization: Bearer your-secret-key-here" \
 - **Status**: `curl http://localhost:3000/status`
 - **Health**: `curl http://localhost:3000/health`
 - **Logs**: Check `out/service.log` for detailed logs
-- **Database**: Browse `out/messages.db` with any SQLite viewer
+- **Data**: Browse `out/messages.json` (and other JSON files) with any viewer
 
 ### **🔧 Common Issues & Solutions**
 **"QR code not showing"**
@@ -435,7 +429,7 @@ curl -H "Authorization: Bearer your-secret-key-here" \
 - Make sure WhatsApp Web is accessible
 
 **"Database errors"**
-- Run `npx drizzle-kit migrate` to update schema
+- Delete `out/messages.json` (and related JSON files) if corrupted and restart
 - Check file permissions on `out/` directory
 
 **"High memory usage"**
@@ -443,7 +437,7 @@ curl -H "Authorization: Bearer your-secret-key-here" \
 - Limit `BOOTSTRAP_CHAT_LIMIT` for initial run
 
 ### **📊 How much storage does it use?**
-- **Database**: ~1MB per 1,000 messages
+- **Data files**: ~1MB per 1,000 messages
 - **Logs**: ~10MB with rotation (configurable)
 - **Memory**: 50-100MB RAM during operation
 
@@ -452,7 +446,7 @@ Yes! Each instance needs:
 - Separate `.wwebjs_auth` directory
 - Different HTTP ports
 - Unique API keys
-- Separate database files
+- Separate `out/` directories
 
 ---
 
