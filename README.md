@@ -142,6 +142,10 @@ curl -H "Authorization: Bearer YOUR_API_KEY" \
 curl -H "Authorization: Bearer YOUR_API_KEY" \
      "http://localhost:3000/api/messages/chat/1234567890@c.us?limit=50&offset=0"
 
+# Messages for specific chat since timestamp (ms)
+curl -H "Authorization: Bearer YOUR_API_KEY" \
+     "http://localhost:3000/api/messages/chat/1234567890@c.us/since?ts=0&limit=200"
+
 # Messages from specific contact
 curl -H "Authorization: Bearer YOUR_API_KEY" \
      "http://localhost:3000/api/messages/contact/1234567890@c.us?limit=50&offset=0"
@@ -153,6 +157,10 @@ curl -H "Authorization: Bearer YOUR_API_KEY" \
 # Messages since timestamp
 curl -H "Authorization: Bearer YOUR_API_KEY" \
      "http://localhost:3000/api/messages/since?ts=1698000000000"
+
+# Messages before timestamp (paging backwards; newest-first)
+curl -H "Authorization: Bearer YOUR_API_KEY" \
+     "http://localhost:3000/api/messages/before?ts=1698000000000&limit=200"
 ```
 
 **Calls Endpoints:**
@@ -166,6 +174,16 @@ curl -H "Authorization: Bearer YOUR_API_KEY" \
      "http://localhost:3000/api/calls/since?ts=1698000000000"
 ```
 
+**Chats/Contacts Endpoints:**
+```bash
+# Active chats (sorted by lastMessageTs desc)
+curl -H "Authorization: Bearer YOUR_API_KEY" \
+     "http://localhost:3000/api/chats/active?limit=50&includeGroups=0"
+
+# Contacts + chat info
+curl -H "Authorization: Bearer YOUR_API_KEY" \
+     "http://localhost:3000/api/contacts?limit=200"
+```
 **API Configuration:**
 ```bash
 # Set your API key in .env

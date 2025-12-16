@@ -502,6 +502,41 @@ function startHTTPServer() {
     }
   });
 
+  app.get('/api/messages/chat/:chatId/since', authenticate, rateLimitMiddleware('api', 300, 60_000), async (req, res) => {
+    try {
+      const { chatId } = req.params;
+      const tsRaw = req.query.ts as any;
+      const ts = Number(tsRaw);
+      if (tsRaw === undefined || Number.isNaN(ts) || ts < 0) {
+        return res.status(400).json({
+          error: 'invalid_ts',
+          detail: 'ts must be a non-negative number (ms)',
+          chatId,
+          tsRaw
+        });
+      }
+      const limit = Math.min(parseInt(req.query.limit as string) || 200, 2000);
+
+      const chats = (db as any).getChats?.() || [];
+      const chatExists = chats.some((c: any) => c.id === chatId);
+      const all = (db as any).getMessagesByChatSince?.(chatId, ts, limit + 1) || [];
+      const messages = all.slice(0, limit);
+      const total = all.length; // up to limit+1
+      const hasMore = total > messages.length;
+
+      res.json({
+        chatId,
+        messages,
+        total,
+        hasMore,
+        truncated: hasMore
+      });
+    } catch (err: any) {
+      log('❌ API Error /api/messages/chat/:chatId/since:', err?.message);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
   // Contacts endpoint
   app.get('/api/contacts', authenticate, rateLimitMiddleware('api', 300, 60_000), async (req, res) => {
     try {
@@ -531,6 +566,38 @@ function startHTTPServer() {
       res.json({ contacts: rows.slice(0, limit) });
     } catch (err: any) {
       log('❌ API Error /api/contacts:', err?.message);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  app.get('/api/chats/active', authenticate, rateLimitMiddleware('api', 300, 60_000), async (req, res) => {
+    try {
+      const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
+      const includeGroups = (req.query.includeGroups as string) !== '0';
+      const contacts = (db as any).getContacts?.() || [];
+      const chats = (db as any).getChats?.() || [];
+
+      const rows = chats
+        .filter((chat: any) => includeGroups ? true : !chat.isGroup)
+        .map((chat: any) => {
+          const contact = contacts.find((c: any) => c.id === chat.id);
+          const displayCandidate = contact?.displayName || chat.name || chat.id;
+          const displayName = preferBestName(chat.name, displayCandidate, `api-active:${chat.id}`) || displayCandidate;
+          return {
+            chatId: chat.id,
+            displayName,
+            pushname: contact?.pushname || null,
+            savedName: contact?.savedName || null,
+            isGroup: !!chat.isGroup,
+            lastMessageTs: chat.lastMessageTs || 0,
+            messageCount: chat.messageCount || 0
+          };
+        })
+        .sort((a: any, b: any) => (b.lastMessageTs || 0) - (a.lastMessageTs || 0));
+
+      res.json(rows.slice(0, limit));
+    } catch (err: any) {
+      log('❌ API Error /api/chats/active:', err?.message);
       res.status(500).json({ error: 'Internal server error' });
     }
   });
@@ -586,22 +653,68 @@ function startHTTPServer() {
 
   app.get('/api/messages/since', authenticate, rateLimitMiddleware('api', 300, 60_000), async (req, res) => {
     try {
-      const ts = parseInt(req.query.ts as string);
-      if (!ts || isNaN(ts)) {
-        return res.status(400).json({ error: 'Invalid timestamp parameter' });
+      const tsRaw = req.query.ts as any;
+      const ts = Number(tsRaw);
+      const path = '/api/messages/since';
+      if (tsRaw === undefined || Number.isNaN(ts) || ts < 0) {
+        return res.status(400).json({
+          error: 'invalid_ts',
+          detail: 'ts must be a non-negative number (ms)',
+          tsRaw,
+          path
+        });
+      }
+      const limit = Math.min(parseInt(req.query.limit as string) || 500, 5000);
+
+      const { messages, total, hasMore } = (db as any).getMessagesSince?.(ts, limit) || { messages: [], total: 0, hasMore: false };
+      const truncated = hasMore && messages.length === limit;
+
+      if (process.env.DEBUG_INTEL) {
+        log(`DEBUG_INTEL: GET ${path} ts=${ts} limit=${limit} returned=${messages.length} total=${total} truncated=${truncated}`);
       }
 
-      // Use SimpleDB methods
-      const allMessages = (db as any).getRecentMessages(1000) || [];
-      const filteredMessages = allMessages.filter((msg: any) => msg.ts >= ts);
-
       res.json({
-        messages: filteredMessages, // Already in correct order (oldest first)
-        total: filteredMessages.length,
-        since: ts
+        messages,
+        total,
+        hasMore,
+        truncated
       });
     } catch (err: any) {
       log('❌ API Error /api/messages/since:', err?.message);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  app.get('/api/messages/before', authenticate, rateLimitMiddleware('api', 300, 60_000), async (req, res) => {
+    try {
+      const tsRaw = req.query.ts as any;
+      const ts = Number(tsRaw);
+      const path = '/api/messages/before';
+      if (tsRaw === undefined || Number.isNaN(ts) || ts < 0) {
+        return res.status(400).json({
+          error: 'invalid_ts',
+          detail: 'ts must be a non-negative number (ms)',
+          tsRaw,
+          path
+        });
+      }
+      const limit = Math.min(parseInt(req.query.limit as string) || 500, 5000);
+
+      const { messages, total, hasMore } = (db as any).getMessagesBefore?.(ts, limit) || { messages: [], total: 0, hasMore: false };
+      const truncated = hasMore && messages.length === limit;
+
+      if (process.env.DEBUG_INTEL) {
+        log(`DEBUG_INTEL: GET ${path} ts=${ts} limit=${limit} returned=${messages.length} total=${total} truncated=${truncated}`);
+      }
+
+      res.json({
+        messages,
+        total,
+        hasMore,
+        truncated
+      });
+    } catch (err: any) {
+      log('❌ API Error /api/messages/before:', err?.message);
       res.status(500).json({ error: 'Internal server error' });
     }
   });

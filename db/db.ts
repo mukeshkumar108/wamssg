@@ -239,11 +239,42 @@ class SimpleDB {
       .slice(0, limit);
   }
 
+  getMessagesByChatSince(chatId: string, sinceTs: number, limit = 2000): Message[] {
+    const res: Message[] = [];
+    for (const msg of this.messages.values()) {
+      if (msg.chatId !== chatId) continue;
+      if (msg.ts < sinceTs) continue;
+      res.push(msg);
+    }
+    res.sort((a, b) => a.ts - b.ts); // oldest-first
+    return res.slice(0, limit);
+  }
+
   getRecentMessages(limit = 100): Message[] {
     return Array.from(this.messages.values())
       .sort((a, b) => b.ts - a.ts)
       .slice(0, limit)
       .reverse();
+  }
+
+  getMessagesSince(ts: number, limit: number): { messages: Message[]; total: number; hasMore: boolean } {
+    const hardLimit = Math.min(Math.max(limit || 0, 1), 5000);
+    const filtered = Array.from(this.messages.values()).filter(m => m.ts >= ts);
+    filtered.sort((a, b) => a.ts - b.ts); // oldest-first
+    const total = filtered.length;
+    const messages = filtered.slice(0, hardLimit);
+    const hasMore = total > messages.length;
+    return { messages, total, hasMore };
+  }
+
+  getMessagesBefore(ts: number, limit: number): { messages: Message[]; total: number; hasMore: boolean } {
+    const hardLimit = Math.min(Math.max(limit || 0, 1), 5000);
+    const filtered = Array.from(this.messages.values()).filter(m => m.ts < ts);
+    filtered.sort((a, b) => b.ts - a.ts); // newest-first for backward paging
+    const total = filtered.length;
+    const messages = filtered.slice(0, hardLimit);
+    const hasMore = total > messages.length;
+    return { messages, total, hasMore };
   }
 
   // Call operations
