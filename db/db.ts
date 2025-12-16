@@ -44,6 +44,8 @@ interface Chat {
   name: string;
   isGroup: boolean;
   archived: boolean;
+  lastMessageTs?: number;
+  messageCount?: number;
 }
 
 interface Contact {
@@ -139,14 +141,19 @@ class SimpleDB {
     this.messages.set(message.id, message);
 
     // Update chat
-    if (!this.chats.has(message.chatId)) {
-      this.chats.set(message.chatId, {
-        id: message.chatId,
-        name: message.chatId,
-        isGroup: false,
-        archived: false
-      });
-    }
+    const existingChat = this.chats.get(message.chatId);
+    const updatedChat: Chat = {
+      ...(existingChat || {}),
+      id: message.chatId,
+      name: existingChat?.name || message.chatId,
+      isGroup: existingChat?.isGroup || false,
+      archived: existingChat?.archived || false,
+      lastMessageTs: existingChat?.lastMessageTs
+        ? Math.max(existingChat.lastMessageTs, message.ts)
+        : message.ts,
+      messageCount: (existingChat?.messageCount || 0) + 1
+    };
+    this.chats.set(message.chatId, updatedChat);
 
     // Update contact
     if (message.senderId !== 'me') {
@@ -179,12 +186,57 @@ class SimpleDB {
     this.saveToFiles();
   }
 
+  hasMessage(id: string): boolean {
+    return this.messages.has(id);
+  }
+
   getMessagesByChat(chatId: string, limit = 50): Message[] {
     return Array.from(this.messages.values())
       .filter(msg => msg.chatId === chatId)
       .sort((a, b) => b.ts - a.ts)
       .slice(0, limit)
       .reverse();
+  }
+
+  getMessageCount(chatId: string): number {
+    let count = 0;
+    for (const msg of this.messages.values()) {
+      if (msg.chatId === chatId) count += 1;
+    }
+    return count;
+  }
+
+  getLatestMessage(chatId: string): Message | undefined {
+    let latest: Message | undefined;
+    for (const msg of this.messages.values()) {
+      if (msg.chatId !== chatId) continue;
+      if (!latest || msg.ts > latest.ts) latest = msg;
+    }
+    return latest;
+  }
+
+  getOldestMessage(chatId: string): Message | undefined {
+    let oldest: Message | undefined;
+    for (const msg of this.messages.values()) {
+      if (msg.chatId !== chatId) continue;
+      if (!oldest || msg.ts < oldest.ts) oldest = msg;
+    }
+    return oldest;
+  }
+
+  getMessageCountSince(chatId: string, sinceTs: number): number {
+    let count = 0;
+    for (const msg of this.messages.values()) {
+      if (msg.chatId === chatId && msg.ts >= sinceTs) count += 1;
+    }
+    return count;
+  }
+
+  getRecentTextMessages(chatId: string, limit = 30): Message[] {
+    return Array.from(this.messages.values())
+      .filter(msg => msg.chatId === chatId && msg.type === "chat" && typeof msg.body === "string")
+      .sort((a, b) => b.ts - a.ts)
+      .slice(0, limit);
   }
 
   getRecentMessages(limit = 100): Message[] {
@@ -211,10 +263,20 @@ class SimpleDB {
   getChats(): Chat[] {
     return Array.from(this.chats.values());
   }
+  updateChatName(chatId: string, name: string) {
+    const existing = this.chats.get(chatId);
+    if (!existing) return;
+    this.chats.set(chatId, { ...existing, name });
+    this.saveToFiles();
+  }
 
   // Contact operations
   getContacts(): Contact[] {
     return Array.from(this.contacts.values());
+  }
+  updateContact(contact: Contact) {
+    this.contacts.set(contact.id, contact);
+    this.saveToFiles();
   }
 
   // Get database stats

@@ -8,8 +8,10 @@ import WAWebJS, { Message, Chat } from 'whatsapp-web.js';
 import { db, initDb } from './db/db';
 import express, { Request, Response } from 'express';
 import QRCode from 'qrcode';
+import helmet from 'helmet';
+import cors from 'cors';
 
-const { Client, LocalAuth } = WAWebJS as any;
+const { Client, LocalAuth, Message: MessageCtor } = WAWebJS as any;
 
 /* ===========================
    Config
@@ -17,6 +19,7 @@ const { Client, LocalAuth } = WAWebJS as any;
 const OUTPUT_DIR = path.join(process.cwd(), 'out');
 const RAW_PATH = path.join(OUTPUT_DIR, 'raw.jsonl');
 const STATUS_PATH = path.join(OUTPUT_DIR, 'status.json');
+const META_PATH = path.join(OUTPUT_DIR, 'meta.json');
 const AUTH_DIR = path.join(process.cwd(), '.wwebjs_auth');
 
 const BOOTSTRAP_CHAT_LIMIT = +(process.env.BOOTSTRAP_CHAT_LIMIT || 15);
@@ -26,11 +29,39 @@ const HEARTBEAT_MS   = +(process.env.HEARTBEAT_MS || 30_000);
 const MAX_RETRIES_BEFORE_AUTH_RESET = +(process.env.MAX_RETRIES_BEFORE_AUTH_RESET || 5);
 const BASE_RETRY_MS  = +(process.env.BASE_RETRY_MS || 5_000);
 const MAX_RETRY_MS   = +(process.env.MAX_RETRY_MS || 60_000);
+const INIT_TIMEOUT_MS = +(process.env.INIT_TIMEOUT_MS || 90_000);
+const QR_MAX_WAIT_MS = +(process.env.QR_MAX_WAIT_MS || 10 * 60 * 1000); // 10 minutes
+const HEARTBEAT_FAILURES_BEFORE_RECONNECT = +(process.env.HEARTBEAT_FAILURES_BEFORE_RECONNECT || 2);
 
 const LOG_PATH = path.join(OUTPUT_DIR, 'service.log');
 const LOG_MAX_BYTES = +(process.env.LOG_MAX_BYTES || 10_000_000); // 10 MB
 const LOG_KEEP = +(process.env.LOG_KEEP || 3); // keep service.log.1 .. .3
 const BACKFILL_BATCH = +(process.env.BACKFILL_BATCH || 100);
+const MAX_BACKFILL_MESSAGES_PER_RUN = +(process.env.MAX_BACKFILL_MESSAGES_PER_RUN || 800);
+const MAX_TIER1_CHATS = 15;
+const TIER1_TARGET_MESSAGES = 300;
+const MAX_TIER2_CHATS = 20;
+const TIER2_TARGET_MESSAGES = 50;
+const MAX_TIER3_GROUP_CHATS = 5;
+const TIER3_TARGET_MESSAGES = 20;
+const MAX_BACKFILL_CHATS_PER_RUN = 5;
+const BACKFILL_DELAY_BETWEEN_CHATS_MS = 1000;
+const ACTION_KEYWORDS = [
+  'tomorrow',
+  'today',
+  'address',
+  'meet',
+  'meeting',
+  'dinner',
+  'booking',
+  'flight',
+  'party',
+  'appointment',
+  'call',
+  'deadline'
+];
+const PINNED_CHAT_IDS = (process.env.PINNED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+const PINNED_CONTACTS = (process.env.PINNED_CONTACTS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
 /* ===========================
    Ensure output dir + DB
@@ -59,10 +90,18 @@ const status = {
   retryCount: 0,
   restartCount: 0,   // NEW
   details: '' as string,
+  needsQr: false,
+  lastError: null as string | null,
+  humanMessage: '',
+  lastStateChangeAt: Date.now(),
 };
 
 function writeStatus(partial: Partial<typeof status>) {
+  const prevState = status.state;
   Object.assign(status, partial);
+  if (partial.state && partial.state !== prevState) {
+    status.lastStateChangeAt = Date.now();
+  }
   try {
     fs.writeFileSync(
       STATUS_PATH,
@@ -70,6 +109,85 @@ function writeStatus(partial: Partial<typeof status>) {
       'utf8'
     );
   } catch {}
+}
+
+/* ===========================
+   Backfill metadata
+=========================== */
+type ChatCursorMeta = {
+  oldestTs?: number;
+  oldestMessageId?: string;
+  lastBackfillAt?: number;
+  backfillExhausted?: boolean;
+  lastBackfillNewSaved?: number;
+  lastBackfillDupes?: number;
+};
+
+type MetaState = {
+  chatCursors: Record<string, ChatCursorMeta>;
+  lastBackfillRun?: {
+    lastRunAt?: number;
+    lastRunSaved?: number;
+    lastRunChats?: number;
+    queuedCandidates?: number;
+  };
+  onboardingCompleted?: boolean;
+};
+
+const meta: MetaState = loadMeta();
+
+function loadMeta(): MetaState {
+  try {
+    if (fs.existsSync(META_PATH)) {
+      const data = fs.readFileSync(META_PATH, 'utf8');
+      return { chatCursors: {}, ...JSON.parse(data) };
+    }
+  } catch (err: any) {
+    console.warn('⚠️ Failed to load meta.json, starting fresh:', err?.message);
+  }
+  return { chatCursors: {} };
+}
+
+function persistMeta() {
+  try {
+    fs.writeFileSync(META_PATH, JSON.stringify(meta, null, 2), 'utf8');
+  } catch (err: any) {
+    console.error('⚠️ Failed to persist meta.json:', err?.message);
+  }
+}
+
+function getCursorMeta(chatId: string): ChatCursorMeta | undefined {
+  return meta.chatCursors[chatId];
+}
+
+function updateCursorAfterBatch(chatId: string, opts: { savedMessages: Message[]; dupes: number; exhausted: boolean }) {
+  const saved = opts.savedMessages || [];
+  const oldest = saved.reduce<{ ts?: number; id?: string }>((acc, m) => {
+    const ts = (m.timestamp || 0) * 1000;
+    if (acc.ts === undefined || ts < (acc.ts || 0)) {
+      return { ts, id: (m.id as any)?._serialized || m.id?.id || m.id };
+    }
+    return acc;
+  }, {});
+
+  const existing = meta.chatCursors[chatId] || {};
+  const next: ChatCursorMeta = {
+    ...existing,
+    oldestTs: oldest.ts ?? existing.oldestTs,
+    oldestMessageId: oldest.id ?? existing.oldestMessageId,
+    lastBackfillAt: Date.now(),
+    backfillExhausted: opts.exhausted || false,
+    lastBackfillNewSaved: saved.length,
+    lastBackfillDupes: opts.dupes
+  };
+
+  // If we actually moved the cursor, backfillExhausted should reset
+  if (saved.length > 0 && oldest.ts !== undefined) {
+    next.backfillExhausted = opts.exhausted;
+  }
+
+  meta.chatCursors[chatId] = next;
+  persistMeta();
 }
 
 /* ===========================
@@ -124,6 +242,29 @@ function createClient() {
 }
 
 let client: any = createClient();
+const onboardingFlags = {
+  inProgress: false
+};
+
+/* ===========================
+   Backfill lock to avoid overlap
+=========================== */
+const backfillLock = { holder: null as string | null };
+
+async function withBackfillLock<T>(name: string, fn: () => Promise<T>): Promise<T | undefined> {
+  if (backfillLock.holder) {
+    if (process.env.DEBUG_INTEL) {
+      log(`DEBUG_INTEL: Backfill ${name} skipped, lock held by ${backfillLock.holder}`);
+    }
+    return;
+  }
+  backfillLock.holder = name;
+  try {
+    return await fn();
+  } finally {
+    backfillLock.holder = null;
+  }
+}
 
 /* ===========================
    Contact cache
@@ -178,6 +319,18 @@ function startHTTPServer() {
 
   // Middleware
   app.use(express.json());
+  app.use(helmet());
+
+  const corsOrigins = (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+  const allowAll = !process.env.NODE_ENV || process.env.NODE_ENV === 'development';
+  app.use(cors({
+    origin: (origin: any, callback: any) => {
+      if (!origin) return callback(null, true);
+      if (allowAll && corsOrigins.length === 0) return callback(null, true);
+      if (corsOrigins.includes(origin)) return callback(null, true);
+      return callback(new Error('CORS not allowed'), false);
+    }
+  }));
 
   // API Key authentication middleware
   const authenticate = (req: Request, res: Response, next: any) => {
@@ -197,6 +350,26 @@ function startHTTPServer() {
       return res.status(401).json({ error: 'Invalid API key' });
     }
 
+    next();
+  };
+  const rateLimiters: Record<string, { count: number; resetAt: number }> = {};
+  function rateLimit(key: string, limit: number, windowMs: number) {
+    const now = Date.now();
+    const bucket = rateLimiters[key] || { count: 0, resetAt: now + windowMs };
+    if (now > bucket.resetAt) {
+      bucket.count = 0;
+      bucket.resetAt = now + windowMs;
+    }
+    bucket.count += 1;
+    rateLimiters[key] = bucket;
+    return bucket.count <= limit;
+  }
+
+  const rateLimitMiddleware = (prefix: string, limit: number, windowMs: number) => (req: Request, res: Response, next: any) => {
+    const key = `${prefix}:${req.ip}`;
+    if (!rateLimit(key, limit, windowMs)) {
+      return res.status(429).json({ error: 'Too many requests' });
+    }
     next();
   };
 
@@ -236,10 +409,24 @@ function startHTTPServer() {
       retryCount: status.retryCount,
       restartCount: status.restartCount,
       details: status.details,
+      needsQr: status.needsQr,
+      lastError: status.lastError,
+      humanMessage: status.humanMessage,
+      lastStateChangeAt: status.lastStateChangeAt,
       databaseSize: dbSize,
       callsCaptured: activeCalls.size,
       version: '1.0.0',
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      backfill: {
+        lastRunAt: meta.lastBackfillRun?.lastRunAt || null,
+        lastRunSaved: meta.lastBackfillRun?.lastRunSaved || 0,
+        lastRunChats: meta.lastBackfillRun?.lastRunChats || 0,
+        queuedCandidates: meta.lastBackfillRun?.queuedCandidates || 0
+      },
+      cursorStats: {
+        totalTracked: Object.keys(meta.chatCursors || {}).length,
+        exhausted: Object.values(meta.chatCursors || {}).filter(c => c.backfillExhausted).length
+      }
     });
   });
 
@@ -257,7 +444,7 @@ function startHTTPServer() {
   });
 
   // API Routes - Messages
-  app.get('/api/messages/recent-chats', authenticate, async (req, res) => {
+  app.get('/api/messages/recent-chats', authenticate, rateLimitMiddleware('api', 300, 60_000), async (req, res) => {
     try {
       const chatsCount = Math.min(parseInt(req.query.chats as string) || 5, 50);
       const messagesPerChat = Math.min(parseInt(req.query.messages as string) || 10, 100);
@@ -290,7 +477,7 @@ function startHTTPServer() {
     }
   });
 
-  app.get('/api/messages/chat/:chatId', authenticate, async (req, res) => {
+  app.get('/api/messages/chat/:chatId', authenticate, rateLimitMiddleware('api', 300, 60_000), async (req, res) => {
     try {
       const { chatId } = req.params;
       const limit = Math.min(parseInt(req.query.limit as string) || 50, 500);
@@ -315,7 +502,40 @@ function startHTTPServer() {
     }
   });
 
-  app.get('/api/messages/contact/:contactId', authenticate, async (req, res) => {
+  // Contacts endpoint
+  app.get('/api/contacts', authenticate, rateLimitMiddleware('api', 300, 60_000), async (req, res) => {
+    try {
+      const limit = Math.min(parseInt(req.query.limit as string) || 200, 500);
+      const contacts = (db as any).getContacts?.() || [];
+      const chats = (db as any).getChats?.() || [];
+      const chatMap = new Map<string, any>();
+      for (const c of chats) chatMap.set(c.id, c);
+
+      const rows = chats.map((chat: any) => {
+        const contact = contacts.find((c: any) => c.id === chat.id);
+        const displayCandidate = contact?.displayName || chat.name || chat.id;
+        const displayName = preferBestName(chat.name, displayCandidate, `api-contact:${chat.id}`) || displayCandidate;
+        return {
+          chatId: chat.id,
+          displayName,
+          pushname: contact?.pushname || null,
+          savedName: contact?.savedName || null,
+          isGroup: !!chat.isGroup,
+          lastMessageTs: chat.lastMessageTs || null,
+          messageCount: chat.messageCount || 0
+        };
+      });
+
+      rows.sort((a: any, b: any) => (b.lastMessageTs || 0) - (a.lastMessageTs || 0));
+
+      res.json({ contacts: rows.slice(0, limit) });
+    } catch (err: any) {
+      log('❌ API Error /api/contacts:', err?.message);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  app.get('/api/messages/contact/:contactId', authenticate, rateLimitMiddleware('api', 300, 60_000), async (req, res) => {
     try {
       const { contactId } = req.params;
       const limit = Math.min(parseInt(req.query.limit as string) || 50, 500);
@@ -346,7 +566,7 @@ function startHTTPServer() {
     }
   });
 
-  app.get('/api/messages/recent', authenticate, async (req, res) => {
+  app.get('/api/messages/recent', authenticate, rateLimitMiddleware('api', 300, 60_000), async (req, res) => {
     try {
       const limit = Math.min(parseInt(req.query.limit as string) || 100, 1000);
 
@@ -364,7 +584,7 @@ function startHTTPServer() {
     }
   });
 
-  app.get('/api/messages/since', authenticate, async (req, res) => {
+  app.get('/api/messages/since', authenticate, rateLimitMiddleware('api', 300, 60_000), async (req, res) => {
     try {
       const ts = parseInt(req.query.ts as string);
       if (!ts || isNaN(ts)) {
@@ -387,7 +607,7 @@ function startHTTPServer() {
   });
 
   // API Routes - Calls
-  app.get('/api/calls/recent', authenticate, async (req, res) => {
+  app.get('/api/calls/recent', authenticate, rateLimitMiddleware('api', 300, 60_000), async (req, res) => {
     try {
       const limit = Math.min(parseInt(req.query.limit as string) || 50, 500);
 
@@ -405,7 +625,7 @@ function startHTTPServer() {
     }
   });
 
-  app.get('/api/calls/since', authenticate, async (req, res) => {
+  app.get('/api/calls/since', authenticate, rateLimitMiddleware('api', 300, 60_000), async (req, res) => {
     try {
       const ts = parseInt(req.query.ts as string);
       if (!ts || isNaN(ts)) {
@@ -548,6 +768,175 @@ function resolvedChatName(chat: Chat): string {
   );
 }
 
+function isPhoneLike(name?: string | null): boolean {
+  if (!name) return false;
+  const cleaned = name.replace(/[^0-9]/g, '');
+  const phoneish = /^[+0-9().\s-]+$/.test(name);
+  return phoneish && cleaned.length >= 6;
+}
+
+function preferBestName(existing: string | null | undefined, incoming: string | null | undefined, ctx?: string): string | undefined {
+  if (!incoming) return existing || undefined;
+  if (!existing) return incoming;
+  const existingIsPhone = isPhoneLike(existing);
+  const incomingIsPhone = isPhoneLike(incoming);
+  if (!existingIsPhone && incomingIsPhone) {
+    if (process.env.DEBUG_INTEL) {
+      log(`DEBUG_INTEL: Prevented name downgrade (${ctx || 'name'}) existing="${existing}" incoming="${incoming}"`);
+    }
+    return existing;
+  }
+  if (existingIsPhone && !incomingIsPhone) return incoming;
+  return incoming;
+}
+
+/* ===========================
+   Cursor-aware message fetch
+=========================== */
+async function fetchMessagesOlderThan(chatIdSerialized: string, cutoffTsMs: number, limit: number): Promise<{ messages: Message[]; oldestTsMs: number | null }> {
+  if (!limit || limit <= 0) return { messages: [], oldestTsMs: null };
+
+  const cutoffSeconds = Math.floor(cutoffTsMs / 1000);
+  const result = await (client as any).pupPage.evaluate(
+    async (chatId: string, cutoffTsSeconds: number, maxMessages: number) => {
+      const w = window as any;
+      const msgFilter = (m: any) => {
+        if (m.isNotification) return false;
+        return m.t < cutoffTsSeconds;
+      };
+
+      const chat = await w.WWebJS.getChat(chatId, { getAsModel: false });
+      if (!chat) return { messages: [], oldestTs: null };
+
+      const collectOlder = () => chat.msgs.getModelsArray().filter(msgFilter);
+
+      let older = collectOlder();
+      let noProgressRounds = 0;
+      while (older.length < maxMessages) {
+        const beforeCount = older.length;
+        const loadedMessages = await w.Store.ConversationMsgs.loadEarlierMsgs(chat);
+        if (!loadedMessages || !loadedMessages.length) break;
+        older = collectOlder();
+        if (older.length <= beforeCount) {
+          noProgressRounds += 1;
+          if (noProgressRounds >= 2) break;
+        } else {
+          noProgressRounds = 0;
+        }
+      }
+
+      older.sort((a: any, b: any) => (a.t > b.t ? 1 : -1));
+      if (older.length > maxMessages) {
+        older = older.slice(-maxMessages);
+      }
+
+      const mapped = older.map((m: any) => w.WWebJS.getMessageModel(m));
+      const oldestTs = older.length ? older[0].t : null;
+      return { messages: mapped, oldestTs };
+    },
+  chatIdSerialized,
+  cutoffSeconds,
+  limit
+);
+
+const messages = (result?.messages || []).map((m: any) => new MessageCtor(client, m));
+const oldestTsMs = result?.oldestTs !== null && result?.oldestTs !== undefined ? (result.oldestTs as number) * 1000 : null;
+return { messages, oldestTsMs };
+}
+
+/* ===========================
+   Targeted backfill helper
+   - Used for onboarding + slow fill
+=========================== */
+async function backfillChatToTarget(chat: Chat, target: number, totals: { saved: number }, seen: Set<string>) {
+  if (seen.has(chat.id._serialized)) return;
+  seen.add(chat.id._serialized);
+  if (status.state !== 'connected') return;
+  const chatId = chat.id._serialized;
+  const existingCount = (db as any).getMessageCount?.(chatId) ?? ((db as any).getMessagesByChat(chatId, target) || []).length;
+  if (existingCount >= target) return;
+  const cursor = getCursorMeta(chatId);
+  if (cursor?.backfillExhausted) return;
+  let remaining = target - existingCount;
+
+  while (remaining > 0 && totals.saved < MAX_BACKFILL_MESSAGES_PER_RUN) {
+    if (status.state !== 'connected') return;
+    const batchLimit = Math.min(BACKFILL_BATCH, remaining, MAX_BACKFILL_MESSAGES_PER_RUN - totals.saved);
+    if (batchLimit <= 0) break;
+    const cutoffTs =
+      cursor?.oldestTs ??
+      (db as any).getOldestMessage?.(chatId)?.ts ??
+      Date.now();
+
+    if (process.env.DEBUG_INTEL) {
+      log(`DEBUG_INTEL: Targeted backfill ${resolvedChatName(chat)} target=${target} existing=${existingCount} remaining=${remaining} cutoffTs=${cutoffTs}`);
+    }
+
+    let messages: Message[] = [];
+    let oldestTsMs: number | null = null;
+    try {
+      const res = await fetchMessagesOlderThan(chatId, cutoffTs, batchLimit);
+      messages = res.messages;
+      oldestTsMs = res.oldestTsMs;
+    } catch (err: any) {
+      log(`⚠️ Targeted backfill fetch error for ${resolvedChatName(chat)}: ${err?.message}`);
+      break;
+    }
+
+    let dupes = 0;
+    const newSaved: Message[] = [];
+    for (const m of messages) {
+      const msgId = (m as any).id?._serialized || (m as any).id?.id || (m as any).id;
+      if (msgId && (db as any).hasMessage?.(msgId)) {
+        dupes += 1;
+        continue;
+      }
+      await saveMessage(m, chat);
+      newSaved.push(m);
+    }
+
+    totals.saved += newSaved.length;
+    remaining -= newSaved.length;
+    const dupRate = messages.length ? dupes / messages.length : 0;
+    const exhausted = messages.length === 0 || (oldestTsMs !== null && oldestTsMs >= cutoffTs);
+    const stalled = dupRate > 0.8 || exhausted;
+
+    updateCursorAfterBatch(chatId, { savedMessages: newSaved, dupes, exhausted });
+
+    if (process.env.DEBUG_INTEL) {
+      log(`DEBUG_INTEL: Targeted backfill stats chat=${chatId} fetched=${messages.length} saved=${newSaved.length} dupes=${dupes} dupRate=${(dupRate*100).toFixed(1)}% exhausted=${exhausted} stalled=${stalled} cursor=${getCursorMeta(chatId)?.oldestTs || 'n/a'}`);
+    }
+
+    if (stalled) break;
+    await new Promise(resolve => setTimeout(resolve, BACKFILL_DELAY_BETWEEN_CHATS_MS));
+  }
+}
+
+/* ===========================
+   Scoring helpers
+=========================== */
+function computeKeywordBoost(chatId: string): number {
+  const recent = ((db as any).getRecentTextMessages?.(chatId, 40) || []) as any[];
+  const regex = new RegExp(`\\b(${ACTION_KEYWORDS.join('|')})\\b`, 'i');
+  const hasKeyword = recent.some(m => typeof m.body === 'string' && regex.test(m.body));
+  return hasKeyword ? 15 : 0;
+}
+
+function isPinnedChat(chat: Chat): boolean {
+  const chatId = chat.id?._serialized || '';
+  if (PINNED_CHAT_IDS.includes(chatId)) return true;
+
+  const name = resolvedChatName(chat).toLowerCase();
+  return PINNED_CONTACTS.some(fragment => fragment && name.includes(fragment));
+}
+
+function computeTargetForScore(score: number, pinned: boolean): number {
+  const base = 50;
+  const max = pinned ? 1000 : 600;
+  const scaled = base + Math.round(score);
+  return Math.max(base, Math.min(max, scaled));
+}
+
 /* ===========================
    Save message
 =========================== */
@@ -561,17 +950,16 @@ async function saveMessage(m: Message, chat: Chat) {
   const notifyName = (m as any)._data?.notifyName || null;
   const chatName = resolvedChatName(chat);
 
-  let displayName = chatName || notifyName || senderId;
-  if (savedName && savedName !== senderId) {
-    displayName = savedName;
-  } else if (resolvedNames.displayName && resolvedNames.displayName !== senderId) {
-    // Next: whatever resolveContactName thought was best
-    displayName = resolvedNames.displayName;
-  } else if (chatName) {
-    displayName = chatName;
-  } else if (notifyName) {
-    displayName = notifyName;
-  }
+  const displayFallback = chatName || notifyName || senderId;
+  const incomingDisplay =
+    savedName ||
+    pushname ||
+    (resolvedNames.displayName && resolvedNames.displayName !== senderId
+      ? resolvedNames.displayName
+      : undefined) ||
+    displayFallback;
+  const existingContact = (db as any).getContacts?.().find((c: any) => c.id === senderId);
+  const displayName = preferBestName(existingContact?.displayName, incomingDisplay, `contact:${senderId}`) || displayFallback;
 
   let participantId: string | null = null;
   let participantName: string | null = null;
@@ -592,7 +980,7 @@ async function saveMessage(m: Message, chat: Chat) {
         }
       : null;
 
-const record = {
+  const record = {
   id: m.id.id,
   chatId: chat.id._serialized,
   senderId,
@@ -644,7 +1032,14 @@ const record = {
     // Don't rethrow - we still have the raw JSONL log
   }
 
-  log(`💬 New message in ${chat.name || displayName}`);
+  // Update chat name in DB, preferring non-phone-like names
+  const existingChat = (db as any).getChats?.().find((c: any) => c.id === chat.id._serialized);
+  const preferredChatName = preferBestName(existingChat?.name, resolvedChatName(chat), `chat:${chat.id._serialized}`) || resolvedChatName(chat);
+  if (preferredChatName && preferredChatName !== existingChat?.name && (db as any).updateChatName) {
+    (db as any).updateChatName(chat.id._serialized, preferredChatName);
+  }
+
+  log(`💬 New message in ${preferredChatName || displayName}`);
 }
 
 /* ===========================
@@ -787,78 +1182,338 @@ async function bootstrap() {
   for (const chat of filtered) {
     log(`➡️ Chat: ${resolvedChatName(chat)}`);
     const messages = await chat.fetchMessages({ limit: BOOTSTRAP_MSG_LIMIT });
+    const savedForChat: Message[] = [];
+    let dupes = 0;
     for (const m of messages) {
+      const msgId = (m as any).id?._serialized || (m as any).id?.id || (m as any).id;
+      if (msgId && (db as any).hasMessage?.(msgId)) {
+        dupes += 1;
+        continue;
+      }
       await saveMessage(m, chat);
+      savedForChat.push(m);
+    }
+    if (savedForChat.length > 0) {
+      updateCursorAfterBatch(chat.id._serialized, {
+        savedMessages: savedForChat,
+        dupes,
+        exhausted: false
+      });
     }
   }
   log('💾 Saved messages to raw.jsonl and database');
 }
 
 /* ===========================
+   Onboarding Backfill (one-time)
+   Phase A: breadth to 50 msgs for top recent 1:1 (30 chats)
+   Phase B: depth to 200 msgs for top 1:1 (10 chats)
+=========================== */
+async function runOnboardingBackfill() {
+  if (meta.onboardingCompleted || onboardingFlags.inProgress) return;
+  onboardingFlags.inProgress = true;
+  await withBackfillLock('onboarding', async () => {
+    if (meta.onboardingCompleted) return;
+    const totals = { saved: 0 };
+    const seen = new Set<string>();
+
+    const runPhase = async (chats: Chat[], target: number, maxChats: number, label: string) => {
+      let processed = 0;
+      for (const chat of chats) {
+        if (processed >= maxChats) break;
+        if (status.state !== 'connected') return;
+        if (chat.isGroup) continue;
+        await backfillChatToTarget(chat, target, totals, seen);
+        processed += 1;
+        if (totals.saved >= MAX_BACKFILL_MESSAGES_PER_RUN) break;
+        await new Promise(resolve => setTimeout(resolve, BACKFILL_DELAY_BETWEEN_CHATS_MS));
+      }
+    };
+
+    try {
+      const chats = await client.getChats();
+      const directChats = chats
+        .filter((c: Chat) => !c.isGroup && resolvedChatName(c) !== 'WhatsApp');
+
+      // Phase A: breadth to 50 for top 30 recent 1:1
+      const topRecent = directChats
+        .sort((a: any, b: any) => {
+          const aTs = (db as any).getLatestMessage?.(a.id._serialized)?.ts || 0;
+          const bTs = (db as any).getLatestMessage?.(b.id._serialized)?.ts || 0;
+          return bTs - aTs;
+        });
+      await runPhase(topRecent, 50, 30, 'breadth');
+
+      // Phase B: depth to 200 for top 10 by recency + message count
+      const topDepth = directChats
+        .map((c: Chat) => {
+          const latest = (db as any).getLatestMessage?.(c.id._serialized)?.ts || 0;
+          const count = (db as any).getMessageCount?.(c.id._serialized) || 0;
+          return { chat: c, score: latest + count };
+        })
+        .sort((a: any, b: any) => b.score - a.score)
+        .map((x: any) => x.chat);
+      await runPhase(topDepth, 200, 10, 'depth');
+
+      meta.onboardingCompleted = true;
+      persistMeta();
+    } catch (err: any) {
+      log(`⚠️ Onboarding backfill failed: ${err?.message}`);
+    } finally {
+      onboardingFlags.inProgress = false;
+    }
+  });
+}
+
+/* ===========================
+   Slow fill scheduler (post-onboarding)
+   - Round robin 1:1 chats to reach 50 msgs
+=========================== */
+const SLOW_FILL_INTERVAL_MS = 30 * 60 * 1000;
+let slowFillIndex = 0;
+
+async function slowFillTick() {
+  if (onboardingFlags.inProgress) return;
+  if (status.state !== 'connected') return;
+  await withBackfillLock('slow-fill', async () => {
+    if (status.state !== 'connected') return;
+    const totals = { saved: 0 };
+    const seen = new Set<string>();
+
+    try {
+      const chats = await client.getChats();
+      const directs = chats.filter((c: Chat) => !c.isGroup && resolvedChatName(c) !== 'WhatsApp');
+      if (directs.length === 0) return;
+
+      // Round-robin starting point
+      const ordered = [...directs.slice(slowFillIndex), ...directs.slice(0, slowFillIndex)];
+      slowFillIndex = (slowFillIndex + 3) % directs.length; // advance pointer modestly
+
+      let processed = 0;
+      for (const chat of ordered) {
+        if (processed >= MAX_BACKFILL_CHATS_PER_RUN) break;
+        if (status.state !== 'connected') return;
+
+        const count = (db as any).getMessageCount?.(chat.id._serialized) || 0;
+        if (count >= 50) continue;
+        await backfillChatToTarget(chat, 50, totals, seen);
+        processed += 1;
+        if (totals.saved >= MAX_BACKFILL_MESSAGES_PER_RUN) break;
+        await new Promise(resolve => setTimeout(resolve, BACKFILL_DELAY_BETWEEN_CHATS_MS));
+      }
+    } catch (err: any) {
+      if (process.env.DEBUG_INTEL) {
+        log(`DEBUG_INTEL: Slow fill tick error: ${err?.message}`);
+      }
+    }
+  });
+}
+
+function scheduleSlowFill() {
+  setInterval(() => {
+    slowFillTick();
+  }, SLOW_FILL_INTERVAL_MS);
+}
+/* ===========================
    Smart Backfill worker
 =========================== */
 async function smartBackfill() {
-  try {
-    log(`🔄 Smart Backfill: scanning recent chats for backfill opportunities…`);
-    const chats: Chat[] = await client.getChats();
-
-    // Only process recent chats (top 20) to avoid memory issues
-    const recentChats = chats
-      .filter((c: Chat) => resolvedChatName(c) !== 'WhatsApp')
-      .slice(0, 20);
-
-    let processedCount = 0;
-    const maxChatsPerRun = 3; // Process max 3 chats per backfill run
-
-    for (const chat of recentChats) {
-      if (processedCount >= maxChatsPerRun) {
-        log(`🔄 Backfill: pausing after ${processedCount} chats (memory management)`);
-        break;
+  await withBackfillLock('smart', async () => {
+    try {
+      if (status.state !== 'connected') {
+        log(`🔄 Smart backfill skipped: client state=${status.state}`);
+        return;
       }
 
+      log(`🔄 Smart Backfill: scanning chats with scoring…`);
+
+      let chats: Chat[];
       try {
-        // Check how many messages we already have for this chat
-        const existingMessages = (db as any).getMessagesByChat(chat.id._serialized, 100000) || [];
-        const existingCount = existingMessages.length;
+        chats = await client.getChats();
+      } catch (err: any) {
+        log(`⚠️ Smart backfill: unable to fetch chats: ${err?.message}`);
+        return;
+      }
 
-        // Only backfill if we have very few messages (<50) to avoid memory spikes
-        if (existingCount < 50) {
-          log(
-            `📥 Backfilling up to ${BACKFILL_BATCH} messages for ${resolvedChatName(
-              chat
-            )} (${existingCount} existing messages)`
-          );
+      const eligibleChats = chats.filter(
+        (c: Chat) =>
+          resolvedChatName(c) !== 'WhatsApp' &&
+          c.id?._serialized !== 'status@broadcast'
+      );
 
-          const msgs = await chat.fetchMessages({ limit: BACKFILL_BATCH });
+      const now = Date.now();
+      const candidates: Array<{
+        chat: Chat;
+        score: number;
+        target: number;
+        existingCount: number;
+        missingCount: number;
+        cutoffTs: number;
+        pinned: boolean;
+      }> = [];
 
-          for (const m of msgs) {
-            await saveMessage(m, chat);
+      for (const chat of eligibleChats) {
+        try {
+          const chatId = chat.id._serialized;
+          const cursor = getCursorMeta(chatId);
+          if (cursor?.backfillExhausted) {
+            continue;
           }
 
-          processedCount++;
+          const latest = (db as any).getLatestMessage?.(chatId);
+          const latestTs = latest?.ts ?? null;
+          const count24h = (db as any).getMessageCountSince?.(chatId, now - 24 * 60 * 60 * 1000) || 0;
+          const count7d = (db as any).getMessageCountSince?.(chatId, now - 7 * 24 * 60 * 60 * 1000) || 0;
+          const keywordBoost = computeKeywordBoost(chatId);
+          const pinned = isPinnedChat(chat);
 
-          // Small delay between chats to prevent memory buildup
-          await new Promise(resolve => setTimeout(resolve, 1000));
+          const recencyScore = latestTs
+            ? Math.max(0, 1 - (now - latestTs) / (14 * 24 * 60 * 60 * 1000)) * 70
+            : 0;
+          const activityScore = count24h * 5 + count7d * 1;
+          const score = recencyScore + activityScore + keywordBoost + (pinned ? 40 : 0);
+
+          const target = computeTargetForScore(score, pinned);
+          const existingCount =
+            (db as any).getMessageCount?.(chatId) ??
+            ((db as any).getMessagesByChat(chatId, target) || []).length;
+          const missingCount = target - existingCount;
+          if (missingCount <= 0) continue;
+
+          const cutoffTs =
+            cursor?.oldestTs ??
+            (db as any).getOldestMessage?.(chatId)?.ts ??
+            Date.now();
+
+          candidates.push({
+            chat,
+            score,
+            target,
+            existingCount,
+            missingCount,
+            cutoffTs,
+            pinned
+          });
+        } catch (err: any) {
+          log(`⚠️ Skipping chat ${resolvedChatName(chat)} due to scoring error: ${err?.message}`);
         }
-      } catch (chatErr: any) {
-        log(`⚠️ Skipping chat ${resolvedChatName(chat)} due to error: ${chatErr?.message}`);
-        continue;
       }
-    }
 
-    if (processedCount > 0) {
-      log(`✅ Smart backfill complete: processed ${processedCount} chats`);
-    } else {
-      log(`🔄 Smart backfill: no chats needed backfill (all have sufficient messages)`);
+      meta.lastBackfillRun = {
+        lastRunAt: Date.now(),
+        lastRunSaved: 0,
+        lastRunChats: 0,
+        queuedCandidates: candidates.length
+      };
+      persistMeta();
+
+      if (candidates.length === 0) {
+        log(`🔄 Smart backfill: nothing to do (no eligible candidates)`);
+        return;
+      }
+
+      candidates.sort((a, b) => b.score - a.score);
+
+      let processedCount = 0;
+      let totalSaved = 0;
+
+      for (const candidate of candidates) {
+        if (processedCount >= MAX_BACKFILL_CHATS_PER_RUN) break;
+        if (totalSaved >= MAX_BACKFILL_MESSAGES_PER_RUN) break;
+
+        const { chat, target, existingCount, missingCount } = candidate;
+        const batchLimit = Math.min(
+          BACKFILL_BATCH,
+          missingCount,
+          MAX_BACKFILL_MESSAGES_PER_RUN - totalSaved
+        );
+        if (batchLimit <= 0) continue;
+
+        const cutoffTs = candidate.cutoffTs || Date.now();
+        log(
+          `📥 Backfill ${resolvedChatName(chat)} score=${candidate.score.toFixed(
+            1
+          )} target=${target} existing=${existingCount} cutoffTs=${cutoffTs}`
+        );
+
+        let messages: Message[] = [];
+        let oldestTsMs: number | null = null;
+        try {
+          const res = await fetchMessagesOlderThan(chat.id._serialized, cutoffTs, batchLimit);
+          messages = res.messages;
+          oldestTsMs = res.oldestTsMs;
+        } catch (chatErr: any) {
+          log(
+            `⚠️ Skipping chat ${resolvedChatName(chat)} due to fetch error: ${chatErr?.message}`
+          );
+          continue;
+        }
+
+        let dupes = 0;
+        const newSaved: Message[] = [];
+
+        for (const m of messages) {
+          const msgId = (m as any).id?._serialized || (m as any).id?.id || (m as any).id;
+          if (msgId && (db as any).hasMessage?.(msgId)) {
+            dupes += 1;
+            continue;
+          }
+          await saveMessage(m, chat);
+          newSaved.push(m);
+        }
+
+        totalSaved += newSaved.length;
+        const dupRate = messages.length ? dupes / messages.length : 0;
+        const exhausted = messages.length === 0 || (oldestTsMs !== null && oldestTsMs >= cutoffTs);
+        const stalled = dupRate > 0.8 || exhausted;
+
+        updateCursorAfterBatch(chat.id._serialized, {
+          savedMessages: newSaved,
+          dupes,
+          exhausted
+        });
+
+        meta.lastBackfillRun = {
+          lastRunAt: Date.now(),
+          lastRunSaved: (meta.lastBackfillRun?.lastRunSaved || 0) + newSaved.length,
+          lastRunChats: (meta.lastBackfillRun?.lastRunChats || 0) + 1,
+          queuedCandidates: meta.lastBackfillRun?.queuedCandidates || candidates.length
+        };
+        persistMeta();
+
+        log(
+          `📊 Backfill ${resolvedChatName(chat)} fetched=${messages.length} newSaved=${newSaved.length} dupes=${dupes} dupRate=${(
+            dupRate * 100
+          ).toFixed(1)}% cursor=${getCursorMeta(chat.id._serialized)?.oldestTs || 'n/a'} exhausted=${exhausted}`
+        );
+        if (stalled) {
+          log(`⚠️ Pagination not advancing for ${resolvedChatName(chat)}; stopping this chat`);
+        }
+
+        processedCount += 1;
+
+        if (totalSaved >= MAX_BACKFILL_MESSAGES_PER_RUN) {
+          log(`⚠️ Backfill run message cap reached (${MAX_BACKFILL_MESSAGES_PER_RUN})`);
+          break;
+        }
+
+        await new Promise(resolve => setTimeout(resolve, BACKFILL_DELAY_BETWEEN_CHATS_MS));
+      }
+
+      if (processedCount > 0) {
+        log(`✅ Smart backfill complete: processed ${processedCount} chats, saved ${totalSaved}`);
+      } else {
+        log(`🔄 Smart backfill: nothing to do (all tier targets satisfied for now)`);
+      }
+    } catch (err: any) {
+      console.error("❌ Smart backfill error:", {
+        message: err?.message,
+        stack: err?.stack,
+        name: err?.name,
+        timestamp: new Date().toISOString()
+      });
     }
-  } catch (err: any) {
-    console.error("❌ Smart backfill error:", {
-      message: err?.message,
-      stack: err?.stack,
-      name: err?.name,
-      timestamp: new Date().toISOString()
-    });
-  }
+  });
 }
 
 /* ===========================
@@ -871,17 +1526,11 @@ function scheduleSmartBackfill() {
     smartBackfill();
   }, 15 * 60 * 1000);
 
-  // Daily run: every 24h ±30m jitter
-  const DAY_MS = 24 * 60 * 60 * 1000;
-  setInterval(() => {
-    const jitter = (Math.random() - 0.5) * 60 * 60 * 1000; // ±30m
-    const delay = Math.max(0, DAY_MS + jitter);
+  const HOUR_MS = 60 * 60 * 1000;
 
-    log(`🕒 Scheduling daily smart backfill with jitter (${(delay/60000).toFixed(0)}m)...`);
-    setTimeout(() => {
-      smartBackfill();
-    }, delay);
-  }, DAY_MS);
+  setInterval(() => {
+    smartBackfill();
+  }, HOUR_MS);
 }
 
 
@@ -897,6 +1546,9 @@ function setupEventHandlers(c: any) {
       state: 'waiting_qr',
       lastQrAt: Date.now(),
       details: 'Scan the QR in WhatsApp → Linked Devices',
+      needsQr: true,
+      lastError: null,
+      humanMessage: 'Waiting for you to scan the WhatsApp QR code.'
     });
 
     console.log(
@@ -913,16 +1565,27 @@ function setupEventHandlers(c: any) {
   c.on('ready', async () => {
     hasEverBeenReady = true;
     isReconnecting = false;
-    writeStatus({ state: 'connected', lastReadyAt: Date.now(), details: '' });
+    writeStatus({
+      state: 'connected',
+      lastReadyAt: Date.now(),
+      details: '',
+      needsQr: false,
+      lastError: null,
+      humanMessage: 'Connected to WhatsApp and ready to ingest messages.'
+    });
     log('✅ WhatsApp client is ready!');
     try {
       await bootstrap();
+      await runOnboardingBackfill();
+      scheduleSlowFill();
       scheduleSmartBackfill();
       // No more immediate backfill - smart backfill starts after 15 minutes
     } catch (err: any) {
       writeStatus({
         state: 'error',
         details: `Bootstrap failed: ${err?.message || err}`,
+        lastError: err?.message || 'Bootstrap failed',
+        humanMessage: 'Connected, but bootstrap failed; check logs.'
       });
       console.error('❌ Bootstrap error:', {
         message: err?.message,
@@ -949,11 +1612,18 @@ function setupEventHandlers(c: any) {
   });
 
   c.on('disconnected', async (reason: string) => {
-    writeStatus({ state: 'reconnecting', details: `Disconnected: ${reason}` });
+    writeStatus({
+      state: 'reconnecting',
+      details: `Disconnected: ${reason}`,
+      humanMessage: 'Disconnected from WhatsApp; attempting to reconnect.',
+      needsQr: false,
+      lastError: reason || null
+    });
     log(`⚠️ Client disconnected: ${reason}. Reconnecting…`);
     await scheduleReconnect();
   });
 }
+
 
 /* ===========================
    Reconnect & auth reset
@@ -963,6 +1633,7 @@ let shuttingDown = false;
 let hasEverBeenReady = false;
 let isInitializing = false;
 let isReconnecting = false;
+let consecutiveHeartbeatFailures = 0;
 
 async function safeDestroy() {
   try {
@@ -972,6 +1643,10 @@ async function safeDestroy() {
 
 async function scheduleReconnect() {
   if (shuttingDown) return;
+  if (status.needsQr && status.state === 'needs_qr') {
+    log('⏳ Reconnect skipped: service is waiting for a new QR scan.');
+    return;
+  }
   if (isInitializing) {
     log('⏳ Reconnect skipped: initialization in progress.');
     return;
@@ -993,6 +1668,9 @@ async function scheduleReconnect() {
   writeStatus({
     state: 'reconnecting',
     details: `Retry #${status.retryCount} in ${delay}ms`,
+    humanMessage: `Reconnecting to WhatsApp (retry #${status.retryCount})…`,
+    lastError: null,
+    needsQr: false,
   });
 
   if (reconnectTimer) clearTimeout(reconnectTimer);
@@ -1001,28 +1679,48 @@ async function scheduleReconnect() {
       isInitializing = true;
       await safeDestroy();
       client = createClient();
-      setupEventHandlers(client);
-      setupCallHandlers(client);
+    setupEventHandlers(client);
+    setupCallHandlers(client);
 
-      if (status.retryCount > MAX_RETRIES_BEFORE_AUTH_RESET) {
-        log('❌ Too many retries → clearing auth and requiring QR scan.');
-        writeStatus({
-          state: 'needs_qr',
-          details: 'Session expired. Clearing auth; will request new QR.',
-        });
-        try {
-          fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-        } catch {}
-        status.retryCount = 0;
-      }
+    if (status.retryCount > MAX_RETRIES_BEFORE_AUTH_RESET) {
+      log('❌ Too many retries → clearing auth and requiring QR scan.');
+      writeStatus({
+        state: 'needs_qr',
+        details: 'Session expired. Clearing auth; will request new QR.',
+        needsQr: true,
+        lastError: 'Too many reconnect attempts; session has been reset and requires a new QR scan.',
+        humanMessage: 'Session expired. Please open WhatsApp → Linked Devices and rescan the QR code.'
+      });
+      try {
+        fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+        fs.rmSync('.wwebjs_cache', { recursive: true, force: true });
+      } catch {}
+      status.retryCount = 0;
+      consecutiveHeartbeatFailures = 0;
+      isInitializing = false;
+      isReconnecting = false;
+      return;
+    }
 
-      await client.initialize();
+    const initPromise = client.initialize();
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('InitTimeout')), INIT_TIMEOUT_MS)
+      );
+
+      await Promise.race([initPromise, timeoutPromise]);
     } catch (err: any) {
       console.error('⚠️ Init failed:', {
         message: err?.message,
         stack: err?.stack,
         name: err?.name,
         timestamp: new Date().toISOString()
+      });
+      writeStatus({
+        state: 'error',
+        details: `Reconnect init failed: ${err?.message || err}`,
+        lastError: err?.message || 'Reconnect init failed',
+        humanMessage: 'Reconnect failed; will retry shortly.',
+        needsQr: status.needsQr
       });
     } finally {
       isInitializing = false;
@@ -1036,24 +1734,65 @@ async function scheduleReconnect() {
 setInterval(async () => {
   const now = Date.now();
 
+  if (
+    status.state === 'waiting_qr' &&
+    status.lastQrAt &&
+    (now - status.lastQrAt) > QR_MAX_WAIT_MS
+  ) {
+    log('⚠️ QR wait exceeded threshold; resetting auth and requesting new QR.');
+    try {
+      fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+    } catch {}
+    status.retryCount = 0;
+    writeStatus({
+      state: 'needs_qr',
+      details: 'QR wait exceeded; resetting auth.',
+      needsQr: true,
+      lastError: 'QR expired; requesting a fresh QR scan.',
+      humanMessage: 'QR expired; requesting a fresh QR scan.'
+    });
+    return;
+  }
+
+  if (status.needsQr && status.state === 'needs_qr') {
+    log('⏳ Heartbeat: waiting for QR scan; skipping reconnect checks.');
+    writeStatus({});
+    return;
+  }
+
   if (!hasEverBeenReady) return;
   if (isInitializing) {
-    log('⏳ Heartbeat: init in progress; skipping state check.');
+    const stuckMs = Date.now() - status.lastStateChangeAt;
+    if (stuckMs > INIT_TIMEOUT_MS * 2) {
+      log('⚠️ Heartbeat: init appears stuck; forcing reconnect.');
+      isInitializing = false;
+      isReconnecting = false;
+      try {
+        await scheduleReconnect();
+      } catch (err: any) {
+        log(`❌ Heartbeat: failed to schedule reconnect after stuck init: ${err?.message || err}`);
+      }
+    } else {
+      log('⏳ Heartbeat: init in progress; skipping state check.');
+    }
     return;
   }
 
   try {
     const s = await client.getState();
     if (s !== 'CONNECTED') {
+      consecutiveHeartbeatFailures += 1;
       log(`⚠️ Heartbeat: client state = ${s}. Triggering reconnect.`);
-      if (!isReconnecting) {
+      if (!isReconnecting && !isInitializing && consecutiveHeartbeatFailures >= HEARTBEAT_FAILURES_BEFORE_RECONNECT) {
         await scheduleReconnect();
       }
       return;
     }
+    consecutiveHeartbeatFailures = 0;
   } catch {
+    consecutiveHeartbeatFailures += 1;
     log('❌ Heartbeat: failed to get client state. Triggering reconnect.');
-    if (!isReconnecting) {
+    if (!isReconnecting && !isInitializing && consecutiveHeartbeatFailures >= HEARTBEAT_FAILURES_BEFORE_RECONNECT) {
       await scheduleReconnect();
     }
     return;
@@ -1071,7 +1810,13 @@ setInterval(async () => {
    Startup & shutdown
 =========================== */
 async function start() {
-  writeStatus({ state: 'starting', details: 'Initializing client…' });
+  writeStatus({
+    state: 'starting',
+    details: 'Initializing client…',
+    needsQr: false,
+    lastError: null,
+    humanMessage: 'Initializing WhatsApp client…'
+  });
 
   setupEventHandlers(client);
   setupCallHandlers(client);
@@ -1079,13 +1824,8 @@ async function start() {
 
   isInitializing = true;
 
-  const initPromise = client.initialize();
-  const timeoutPromise = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error("InitTimeout")), 60000) // 60s startup watchdog
-  );
-
   try {
-    await Promise.race([initPromise, timeoutPromise]);
+    await client.initialize();
   } catch (err: any) {
     console.error('⚠️ Initial init failed:', {
       message: err?.message,
@@ -1095,28 +1835,43 @@ async function start() {
     });
 
     // If init froze or WhatsApp Web never loaded → restart
-    isInitializing = false;
+    writeStatus({
+      state: 'error',
+      details: `Init failed: ${err?.message || err}`,
+      lastError: err?.message || 'Init failed',
+      humanMessage: 'Initialization failed; attempting to reconnect...'
+    });
     await scheduleReconnect();
     return;
   } finally {
-    if (isInitializing) isInitializing = false;
+    isInitializing = false;
   }
 }
 
-async function shutdown() {
+async function shutdown(reason = 'signal') {
+  if (shuttingDown) return;
   shuttingDown = true;
   writeStatus({
     state: 'shutting_down',
-    details: 'Received termination signal',
+    details: `Received termination (${reason})`,
   });
   if (reconnectTimer) clearTimeout(reconnectTimer);
   try {
     await safeDestroy();
-  } catch {}
-  process.exit(0);
+  } catch (err: any) {
+    log(`⚠️ Error during client destroy: ${err?.message || err}`);
+  }
+  try {
+    if (httpServer) {
+      httpServer.close?.();
+    }
+  } catch (err: any) {
+    log(`⚠️ Error during HTTP server close: ${err?.message || err}`);
+  }
+  setTimeout(() => process.exit(0), 0);
 }
 
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 start();

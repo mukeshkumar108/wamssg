@@ -21,8 +21,14 @@ Runs headlessly 24/7, captures all messages/chats/contacts/reactions, and saves 
 - ✅ **Advanced Logging**: Rotated log files with structured error reporting
 - ✅ **Health Monitoring**: 30-second heartbeat with connection state tracking
 - ✅ **Smart Backfill**: Automated daily backfill with collision avoidance
+  - Cursor-based pagination (older-than cursor; no guesses)
+  - Scoring: recency + activity + keyword + pinned boosts
+  - Dynamic targets: base 50 → up to 600 (1000 for pinned), caps per run
+  - Safety: dup detection, pagination stall guard, per-run message/chat caps
 - ✅ **Graceful Shutdown**: Proper resource cleanup on exit signals
 - ✅ **Comprehensive Error Handling**: Stack traces and structured error logging
+- ✅ **Security Hardening**: API key auth on `/api/*`, CORS allowlist, rate limiting on `/qr` and `/api/*`, secure headers (helmet)
+- ✅ **Readiness/Deps Probes**: `/health/deps` (WhatsApp state + storage write) and `/ready` (connected or waiting_qr)
 
 ### **Configuration**
 - ✅ **Environment Variables**: Extensive configuration options
@@ -49,8 +55,8 @@ All data lives in `out/`:
 ### **Environment Variables**
 ```bash
 # Bootstrap settings
-BOOTSTRAP_CHAT_LIMIT=15          # Chats to process on startup
-BOOTSTRAP_MSG_LIMIT=20           # Messages per chat to fetch
+BOOTSTRAP_CHAT_LIMIT=15          # Chats to process on startup (env override to go higher)
+BOOTSTRAP_MSG_LIMIT=20           # Messages per chat during bootstrap (env override to go higher)
 
 # Timing settings
 HEARTBEAT_MS=30000               # Health check interval (30s)
@@ -58,8 +64,11 @@ BASE_RETRY_MS=5000               # Initial retry delay
 MAX_RETRY_MS=60000               # Maximum retry delay
 
 # Backfill settings
-BACKFILL_BATCH=100               # Messages per backfill batch
-BACKFILL_ALL=true               # Enable immediate backfill on startup
+BACKFILL_BATCH=100               # Max messages per chat per batch
+MAX_BACKFILL_MESSAGES_PER_RUN=800 # Global cap per run
+MAX_BACKFILL_CHATS_PER_RUN=5     # Chats processed per run (score-ranked)
+PINNED_CHAT_IDS=                 # Optional, comma-separated
+PINNED_CONTACTS=                 # Optional, comma-separated
 
 # Logging
 LOG_MAX_BYTES=10000000           # Log rotation size (10MB)
@@ -102,6 +111,8 @@ Once running, the service exposes:
 - **`/qr`** - Current QR code as base64 (for React frontend integration)
 - **`/status`** - Comprehensive service health and metrics
 - **`/health`** - Simple health check for containers
+- **`/health/deps`** - WhatsApp state + storage write check
+- **`/ready`** - 200 only when client is connected or waiting for QR
 
 ```bash
 # Get QR code for frontend
@@ -402,6 +413,23 @@ docker run -d --name whatsapp-get \
   -p 3000:3000 \
   whatsapp-get
 ```
+Or with docker-compose:
+```yaml
+services:
+  whatsapp-ingestor:
+    build: .
+    restart: always
+    init: true
+    stop_grace_period: 30s
+    ports: ["3000:3000"]
+    volumes:
+      - whatsapp_auth:/app/.wwebjs_auth
+      - whatsapp_data:/app/out
+volumes:
+  whatsapp_auth:
+  whatsapp_data:
+```
+Auth/session lives in `/app/.wwebjs_auth`; data lives in `/app/out`. Keep both volumes persistent. Entrypoint removes stale Chromium `Singleton*` locks automatically; do not delete the auth volume unless you want to re-scan the QR.
 
 ### **🔑 How do I use the API?**
 ```bash
