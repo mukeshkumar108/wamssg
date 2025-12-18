@@ -437,8 +437,7 @@ function startHTTPServer() {
 
   // Health check endpoint for containers
   app.get('/health', (req, res) => {
-    const isHealthy = status.state === 'connected' &&
-                     (Date.now() - status.lastMessageAt) < (10 * 60 * 1000); // 10 minutes
+    const isHealthy = status.state === 'connected' || status.state === 'waiting_qr';
 
     res.status(isHealthy ? 200 : 503).json({
       healthy: isHealthy,
