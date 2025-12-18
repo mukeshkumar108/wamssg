@@ -20,10 +20,10 @@ Runs headlessly 24/7, captures all messages/chats/contacts/reactions, and saves 
 - ✅ **Contact Caching**: 24-hour TTL cache reduces API calls by ~80%
 - ✅ **Advanced Logging**: Rotated log files with structured error reporting
 - ✅ **Health Monitoring**: 30-second heartbeat with connection state tracking
-- ✅ **Smart Backfill**: Automated daily backfill with collision avoidance
-  - Cursor-based pagination (older-than cursor; no guesses)
-  - Scoring: recency + activity + keyword + pinned boosts
-  - Dynamic targets: base 50 → up to 600 (1000 for pinned), caps per run
+- ✅ **Backfill System**: Cursor-based pagination with mutex to avoid overlap
+  - **Coverage Fill**: Baseline storage for all direct chats (and optional groups) to floor targets
+  - **Smart Backfill**: Priority targets → pinned chats → scored candidates
+  - **Targets API**: Push per-chat depth targets and auto-clear when met
   - Safety: dup detection, pagination stall guard, per-run message/chat caps
 - ✅ **Graceful Shutdown**: Proper resource cleanup on exit signals
 - ✅ **Comprehensive Error Handling**: Stack traces and structured error logging
@@ -50,6 +50,14 @@ All data lives in `out/`:
 
 ---
 
+## 🧠 Backfill Overview
+- **Coverage Fill** (baseline): Round-robin baseline to keep direct chats at `DIRECT_BASELINE_MESSAGES` (optionally groups at `GROUP_BASELINE_MESSAGES` when `COVERAGE_INCLUDE_GROUPS=true`). Uses global mutex and respects per-run chat/message caps.
+- **Smart Backfill** (context depth): Runs on schedule; processes in order: forced targets (`/api/backfill/targets`), pinned chats (`PINNED_*` → `PRIORITY_TARGET_MESSAGES`), then scored candidates (directs capped at `DIRECT_CONTEXT_MESSAGES`, groups at `GROUP_BASELINE_MESSAGES`). Clears forced targets once reached.
+- **Targets API**: POST `/api/backfill/targets` to request per-chat depth (capped by `MAX_TARGET_MESSAGES`). Logs when applied/reached.
+- **Locking & Safety**: All backfill lanes share a mutex (`withBackfillLock`), use cursor-based pagination, duplicate detection, stall guards, and `MAX_BACKFILL_*` caps with delays between chats.
+
+---
+
 ## ⚙️ Configuration
 
 ### **Environment Variables**
@@ -69,6 +77,13 @@ MAX_BACKFILL_MESSAGES_PER_RUN=800 # Global cap per run
 MAX_BACKFILL_CHATS_PER_RUN=5     # Chats processed per run (score-ranked)
 PINNED_CHAT_IDS=                 # Optional, comma-separated
 PINNED_CONTACTS=                 # Optional, comma-separated
+COVERAGE_FILL_INTERVAL_MS=1800000 # Coverage baseline cadence (30m default)
+DIRECT_BASELINE_MESSAGES=50       # Coverage baseline for 1:1 chats
+DIRECT_CONTEXT_MESSAGES=100       # Smart backfill target for 1:1 chats
+GROUP_BASELINE_MESSAGES=30        # Coverage baseline for groups (when enabled)
+COVERAGE_INCLUDE_GROUPS=false     # Include groups in coverage baseline
+PRIORITY_TARGET_MESSAGES=300      # Target depth for pinned chats
+MAX_TARGET_MESSAGES=500           # Cap for per-chat targets
 
 # Logging
 LOG_MAX_BYTES=10000000           # Log rotation size (10MB)
@@ -161,6 +176,10 @@ curl -H "Authorization: Bearer YOUR_API_KEY" \
 # Messages before timestamp (paging backwards; newest-first)
 curl -H "Authorization: Bearer YOUR_API_KEY" \
      "http://localhost:3000/api/messages/before?ts=1698000000000&limit=200"
+
+# Older messages for a chat before timestamp (newest-first paging)
+curl -H "Authorization: Bearer YOUR_API_KEY" \
+     "http://localhost:3000/api/messages/chat/1234567890@c.us/before?ts=1698000000000&limit=200"
 ```
 
 **Calls Endpoints:**
@@ -183,6 +202,23 @@ curl -H "Authorization: Bearer YOUR_API_KEY" \
 # Contacts + chat info
 curl -H "Authorization: Bearer YOUR_API_KEY" \
      "http://localhost:3000/api/contacts?limit=200"
+
+# Coverage status (baseline progress)
+curl -H "Authorization: Bearer YOUR_API_KEY" \
+     "http://localhost:3000/api/coverage/status"
+
+# Debug state snapshot (safe, no sensitive data)
+curl -H "Authorization: Bearer YOUR_API_KEY" \
+     "http://localhost:3000/api/debug/state"
+
+# Push priority backfill targets
+curl -X POST -H "Authorization: Bearer YOUR_API_KEY" -H "Content-Type: application/json" \
+     -d '{"targets":[{"chatId":"1234567890@c.us","targetMessages":300}]}' \
+     "http://localhost:3000/api/backfill/targets"
+
+# Dev-only manual backfill tick (disabled in production)
+curl -X POST -H "Authorization: Bearer YOUR_API_KEY" \
+     "http://localhost:3000/api/backfill/run?mode=coverage"
 ```
 **API Configuration:**
 ```bash
@@ -192,7 +228,7 @@ API_KEY=your-secure-api-key-here-change-this-in-production
 
 ---
 
-## � Production Deployment
+## 📦 Production Deployment
 
 ### **PM2 (Recommended)**
 ```bash

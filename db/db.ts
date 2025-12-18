@@ -277,6 +277,16 @@ class SimpleDB {
     return { messages, total, hasMore };
   }
 
+  getMessagesByChatBefore(chatId: string, ts: number, limit: number): { messages: Message[]; total: number; hasMore: boolean } {
+    const hardLimit = Math.min(Math.max(limit || 0, 1), 5000);
+    const filtered = Array.from(this.messages.values()).filter(m => m.chatId === chatId && m.ts < ts);
+    filtered.sort((a, b) => b.ts - a.ts); // newest-first for backward paging
+    const total = filtered.length;
+    const messages = filtered.slice(0, hardLimit);
+    const hasMore = total > messages.length;
+    return { messages, total, hasMore };
+  }
+
   // Call operations
   saveCall(call: Call) {
     this.calls.set(call.id, call);

@@ -38,14 +38,15 @@ const LOG_MAX_BYTES = +(process.env.LOG_MAX_BYTES || 10_000_000); // 10 MB
 const LOG_KEEP = +(process.env.LOG_KEEP || 3); // keep service.log.1 .. .3
 const BACKFILL_BATCH = +(process.env.BACKFILL_BATCH || 100);
 const MAX_BACKFILL_MESSAGES_PER_RUN = +(process.env.MAX_BACKFILL_MESSAGES_PER_RUN || 800);
-const MAX_TIER1_CHATS = 15;
-const TIER1_TARGET_MESSAGES = 300;
-const MAX_TIER2_CHATS = 20;
-const TIER2_TARGET_MESSAGES = 50;
-const MAX_TIER3_GROUP_CHATS = 5;
-const TIER3_TARGET_MESSAGES = 20;
 const MAX_BACKFILL_CHATS_PER_RUN = 5;
 const BACKFILL_DELAY_BETWEEN_CHATS_MS = 1000;
+const COVERAGE_FILL_INTERVAL_MS = +(process.env.COVERAGE_FILL_INTERVAL_MS || 30 * 60 * 1000);
+const MAX_TARGET_MESSAGES = +(process.env.MAX_TARGET_MESSAGES || 500);
+const DIRECT_BASELINE_MESSAGES = +(process.env.DIRECT_BASELINE_MESSAGES || 50);
+const DIRECT_CONTEXT_MESSAGES = +(process.env.DIRECT_CONTEXT_MESSAGES || 100);
+const GROUP_BASELINE_MESSAGES = +(process.env.GROUP_BASELINE_MESSAGES || 30);
+const PRIORITY_TARGET_MESSAGES = +(process.env.PRIORITY_TARGET_MESSAGES || 300);
+const COVERAGE_INCLUDE_GROUPS = (process.env.COVERAGE_INCLUDE_GROUPS || 'false').toLowerCase() === 'true';
 const ACTION_KEYWORDS = [
   'tomorrow',
   'today',
@@ -62,6 +63,9 @@ const ACTION_KEYWORDS = [
 ];
 const PINNED_CHAT_IDS = (process.env.PINNED_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 const PINNED_CONTACTS = (process.env.PINNED_CONTACTS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+
+let lastCoverageFillAt: number | null = null;
+let lastSmartBackfillAt: number | null = null;
 
 /* ===========================
    Ensure output dir + DB
@@ -132,6 +136,7 @@ type MetaState = {
     queuedCandidates?: number;
   };
   onboardingCompleted?: boolean;
+  backfillTargets?: Record<string, number>;
 };
 
 const meta: MetaState = loadMeta();
@@ -140,12 +145,12 @@ function loadMeta(): MetaState {
   try {
     if (fs.existsSync(META_PATH)) {
       const data = fs.readFileSync(META_PATH, 'utf8');
-      return { chatCursors: {}, ...JSON.parse(data) };
+      return { chatCursors: {}, backfillTargets: {}, ...JSON.parse(data) };
     }
   } catch (err: any) {
     console.warn('⚠️ Failed to load meta.json, starting fresh:', err?.message);
   }
-  return { chatCursors: {} };
+  return { chatCursors: {}, backfillTargets: {} };
 }
 
 function persistMeta() {
@@ -537,6 +542,44 @@ function startHTTPServer() {
     }
   });
 
+  app.get('/api/messages/chat/:chatId/before', authenticate, rateLimitMiddleware('api', 300, 60_000), async (req, res) => {
+    try {
+      const { chatId } = req.params;
+      const tsRaw = req.query.ts as any;
+      let ts = Number(tsRaw);
+      const path = '/api/messages/chat/:chatId/before';
+      if (tsRaw === undefined || Number.isNaN(ts) || ts < 0) {
+        return res.status(400).json({
+          error: 'invalid_ts',
+          detail: 'ts must be a non-negative number (ms)',
+          tsRaw,
+          path
+        });
+      }
+      // treat ts=0 as "now" for cutoff
+      if (ts === 0) ts = Date.now();
+      const limit = Math.min(parseInt(req.query.limit as string) || 200, 2000);
+
+      const { messages, total, hasMore } = (db as any).getMessagesByChatBefore?.(chatId, ts, limit) || { messages: [], total: 0, hasMore: false };
+      const truncated = hasMore && messages.length === limit;
+
+      if (process.env.DEBUG_INTEL) {
+        log(`DEBUG_INTEL: GET ${path} chatId=${chatId} ts=${ts} limit=${limit} returned=${messages.length} total=${total} truncated=${truncated}`);
+      }
+
+      res.json({
+        chatId,
+        messages,
+        total,
+        hasMore,
+        truncated
+      });
+    } catch (err: any) {
+      log('❌ API Error /api/messages/chat/:chatId/before:', err?.message);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
   // Contacts endpoint
   app.get('/api/contacts', authenticate, rateLimitMiddleware('api', 300, 60_000), async (req, res) => {
     try {
@@ -548,7 +591,29 @@ function startHTTPServer() {
 
       const rows = chats.map((chat: any) => {
         const contact = contacts.find((c: any) => c.id === chat.id);
-        const displayCandidate = contact?.displayName || chat.name || chat.id;
+        const candidates = {
+          savedName: contact?.savedName || null,
+          pushName: contact?.pushname || null,
+          verifiedName: contact?.verifiedName || null,
+          chatName: chat.name || null,
+          fallbackId: chat.id
+        };
+        let displayCandidate = contact?.displayName || chat.name || chat.id;
+        let bestNameSource: 'saved' | 'push' | 'verified' | 'chat' | 'fallback' = 'fallback';
+        if (candidates.savedName) {
+          displayCandidate = candidates.savedName;
+          bestNameSource = 'saved';
+        } else if (candidates.pushName) {
+          displayCandidate = candidates.pushName;
+          bestNameSource = 'push';
+        } else if (candidates.verifiedName) {
+          displayCandidate = candidates.verifiedName;
+          bestNameSource = 'verified';
+        } else if (candidates.chatName) {
+          displayCandidate = candidates.chatName;
+          bestNameSource = 'chat';
+        }
+
         const displayName = preferBestName(chat.name, displayCandidate, `api-contact:${chat.id}`) || displayCandidate;
         return {
           chatId: chat.id,
@@ -557,7 +622,9 @@ function startHTTPServer() {
           savedName: contact?.savedName || null,
           isGroup: !!chat.isGroup,
           lastMessageTs: chat.lastMessageTs || null,
-          messageCount: chat.messageCount || 0
+          messageCount: chat.messageCount || 0,
+          nameCandidates: candidates,
+          bestNameSource
         };
       });
 
@@ -715,6 +782,117 @@ function startHTTPServer() {
       });
     } catch (err: any) {
       log('❌ API Error /api/messages/before:', err?.message);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  app.post('/api/backfill/targets', authenticate, rateLimitMiddleware('api', 60, 60_000), async (req, res) => {
+    try {
+      const body = req.body;
+      if (!body || !Array.isArray(body.targets)) {
+        return res.status(400).json({ error: 'Invalid payload: expected { targets: [{ chatId, targetMessages }] }' });
+      }
+
+      const updated: Record<string, number> = { ...(meta.backfillTargets || {}) };
+      for (const t of body.targets) {
+        if (!t || typeof t.chatId !== 'string') continue;
+        const targetVal = typeof t.targetMessages === 'number' ? t.targetMessages : parseInt(t.targetMessages, 10);
+        if (!targetVal || isNaN(targetVal) || targetVal <= 0) continue;
+        const clamped = Math.min(Math.max(targetVal, 1), MAX_TARGET_MESSAGES);
+        updated[t.chatId] = clamped;
+      }
+
+      meta.backfillTargets = updated;
+      persistMeta();
+      const entries = Object.entries(updated).map(([chatId, target]) => `${chatId}:${target}`).join(',') || 'none';
+      log(`🎯 Backfill targets updated: ${entries}`);
+      return res.json({ ok: true, targets: updated });
+    } catch (err: any) {
+      log('❌ API Error /api/backfill/targets:', err?.message);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  app.get('/api/coverage/status', authenticate, rateLimitMiddleware('api', 120, 60_000), async (_req, res) => {
+    try {
+      const snapshot = computeCoverageStatus();
+      res.json(snapshot);
+    } catch (err: any) {
+      log('❌ API Error /api/coverage/status:', err?.message);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  app.get('/api/debug/state', authenticate, rateLimitMiddleware('api', 120, 60_000), async (_req, res) => {
+    try {
+      const stats = (db as any).getStats?.() || { messages: 0, chats: 0 };
+      const chats = (db as any).getChats?.() || [];
+      const directChatsTotal = chats.filter((c: any) => !c.isGroup).length;
+      const groupChatsTotal = chats.filter((c: any) => c.isGroup).length;
+      const backfillTargetsEntries = Object.entries(meta.backfillTargets || {});
+      const backfillTargetsTop = backfillTargetsEntries.slice(0, 10).map(([chatId, targetMessages]) => ({ chatId, targetMessages }));
+
+      res.json({
+        clientState: status.state,
+        uptimeSec: Math.round(process.uptime()),
+        outputDir: OUTPUT_DIR,
+        authDir: AUTH_DIR,
+        config: {
+          BOOTSTRAP_CHAT_LIMIT,
+          BOOTSTRAP_MSG_LIMIT,
+          BACKFILL_BATCH,
+          MAX_BACKFILL_MESSAGES_PER_RUN,
+          MAX_BACKFILL_CHATS_PER_RUN,
+          DIRECT_BASELINE_MESSAGES,
+          DIRECT_CONTEXT_MESSAGES,
+          GROUP_BASELINE_MESSAGES,
+          PRIORITY_TARGET_MESSAGES,
+          MAX_TARGET_MESSAGES,
+          COVERAGE_FILL_INTERVAL_MS,
+          COVERAGE_INCLUDE_GROUPS,
+          PINNED_CHAT_IDS_COUNT: PINNED_CHAT_IDS.length,
+          PINNED_CONTACTS_COUNT: PINNED_CONTACTS.length
+        },
+        backfill: {
+          backfillTargetsCount: backfillTargetsEntries.length,
+          backfillTargetsTop,
+          chatsTotal: stats.chats || chats.length,
+          directChatsTotal,
+          groupChatsTotal,
+          messagesTotalStored: stats.messages || 0,
+          mutexLocked: !!backfillLock.holder
+        }
+      });
+    } catch (err: any) {
+      log('❌ API Error /api/debug/state:', err?.message);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  // Dev-only manual trigger for backfill ticks
+  app.post('/api/backfill/run', authenticate, rateLimitMiddleware('api', 30, 60_000), async (req, res) => {
+    try {
+      if (process.env.NODE_ENV === 'production') {
+        return res.status(404).json({ error: 'disabled_in_production' });
+      }
+
+      const mode = (req.query.mode as string || '').toLowerCase();
+      if (backfillLock.holder) {
+        return res.status(409).json({ error: 'lock_held' });
+      }
+
+      if (mode === 'coverage') {
+        await coverageFillTick();
+        return res.json({ ok: true, ran: 'coverage' });
+      }
+      if (mode === 'smart') {
+        await smartBackfill();
+        return res.json({ ok: true, ran: 'smart' });
+      }
+
+      return res.status(400).json({ error: 'invalid_mode', detail: 'mode must be coverage or smart' });
+    } catch (err: any) {
+      log('❌ API Error /api/backfill/run:', err?.message);
       res.status(500).json({ error: 'Internal server error' });
     }
   });
@@ -888,9 +1066,35 @@ function isPhoneLike(name?: string | null): boolean {
   return phoneish && cleaned.length >= 6;
 }
 
+function isBadName(name?: string | null): boolean {
+  if (!name) return true;
+  const n = name.trim();
+  if (!n) return true;
+  if (/^\d+@c\.us$/i.test(n)) return true;
+  if (/@lid$/i.test(n)) return true;
+  if (n === 'status@broadcast') return true;
+  return false;
+}
+
+function isGoodName(name?: string | null): boolean {
+  if (!name) return false;
+  const n = name.trim();
+  if (!n) return false;
+  if (isBadName(n)) return false;
+  if (isPhoneLike(n)) return false;
+  return true;
+}
+
 function preferBestName(existing: string | null | undefined, incoming: string | null | undefined, ctx?: string): string | undefined {
   if (!incoming) return existing || undefined;
   if (!existing) return incoming;
+  if (isGoodName(existing) && isBadName(incoming)) {
+    if (process.env.DEBUG_INTEL) {
+      log(`DEBUG_INTEL: Prevented name downgrade (bad incoming) ctx=${ctx || 'name'} existing="${existing}" incoming="${incoming}"`);
+    }
+    return existing;
+  }
+  if (isBadName(existing) && isGoodName(incoming)) return incoming;
   const existingIsPhone = isPhoneLike(existing);
   const incomingIsPhone = isPhoneLike(incoming);
   if (!existingIsPhone && incomingIsPhone) {
@@ -1041,13 +1245,6 @@ function isPinnedChat(chat: Chat): boolean {
 
   const name = resolvedChatName(chat).toLowerCase();
   return PINNED_CONTACTS.some(fragment => fragment && name.includes(fragment));
-}
-
-function computeTargetForScore(score: number, pinned: boolean): number {
-  const base = 50;
-  const max = pinned ? 1000 : 600;
-  const scaled = base + Math.round(score);
-  return Math.max(base, Math.min(max, scaled));
 }
 
 /* ===========================
@@ -1423,9 +1620,304 @@ async function slowFillTick() {
 }
 
 function scheduleSlowFill() {
+  // Deprecated: coverage fill replaces slow fill; keep stub to avoid accidental scheduling.
+}
+
+/* ===========================
+   Coverage fill scheduler
+   - Ensures a minimum floor for direct chats
+=========================== */
+function computeCoverageStatus() {
+  const nowTs = Date.now();
+  const chats = (db as any).getChats?.() || [];
+  let directChatsTotal = 0;
+  let directChatsAtBaseline = 0;
+  let groupChatsTotal = 0;
+  let groupChatsAtBaseline = 0;
+
+  for (const chat of chats) {
+    if (!chat || !chat.id) continue;
+    if (chat.name === 'WhatsApp' || chat.id === 'status@broadcast') continue;
+    const isGroup = (chat as any).isGroup;
+    const count = (db as any).getMessageCount?.(chat.id) || 0;
+    if (isGroup) {
+      if (!COVERAGE_INCLUDE_GROUPS) continue;
+      groupChatsTotal += 1;
+      if (count >= GROUP_BASELINE_MESSAGES) groupChatsAtBaseline += 1;
+    } else {
+      directChatsTotal += 1;
+      if (count >= DIRECT_BASELINE_MESSAGES) directChatsAtBaseline += 1;
+    }
+  }
+
+  const directCoveragePct = directChatsTotal ? (directChatsAtBaseline / directChatsTotal) * 100 : 0;
+  const groupCoveragePct = groupChatsTotal ? (groupChatsAtBaseline / groupChatsTotal) * 100 : 0;
+  const coverageDenominator = directChatsTotal + (COVERAGE_INCLUDE_GROUPS ? groupChatsTotal : 0);
+  const overallCoveragePct = coverageDenominator
+    ? ((directChatsAtBaseline + (COVERAGE_INCLUDE_GROUPS ? groupChatsAtBaseline : 0)) / coverageDenominator) * 100
+    : 0;
+
+  return {
+    nowTs,
+    directBaselineTarget: DIRECT_BASELINE_MESSAGES,
+    groupBaselineTarget: GROUP_BASELINE_MESSAGES,
+    includeGroups: COVERAGE_INCLUDE_GROUPS,
+    directChatsTotal,
+    directChatsAtBaseline,
+    directCoveragePct,
+    groupChatsTotal: COVERAGE_INCLUDE_GROUPS ? groupChatsTotal : 0,
+    groupChatsAtBaseline: COVERAGE_INCLUDE_GROUPS ? groupChatsAtBaseline : 0,
+    groupCoveragePct: COVERAGE_INCLUDE_GROUPS ? groupCoveragePct : 0,
+    overallCoveragePct,
+    pendingTargetsCount: Object.keys(meta.backfillTargets || {}).length,
+    lastCoverageFillAt,
+    lastSmartBackfillAt
+  };
+}
+
+let coverageFillIndex = 0;
+let coverageFillScheduled = false;
+
+async function coverageFillTick() {
+  const summary = {
+    chatsChecked: 0,
+    chatsBackfilled: 0,
+    messagesFetched: 0,
+    skippedDueToLock: 0,
+    stoppedDueToDisconnect: 0
+  };
+  const markDisconnected = () => {
+    if (!summary.stoppedDueToDisconnect) {
+      log('📈 Coverage fill: SKIP (disconnected)');
+    }
+    summary.stoppedDueToDisconnect = 1;
+  };
+
+  if (status.state !== 'connected') {
+    markDisconnected();
+    log(
+      `📈 Coverage fill: chatsChecked=${summary.chatsChecked} chatsBackfilled=${summary.chatsBackfilled} messagesFetched=${summary.messagesFetched} skippedDueToLock=${summary.skippedDueToLock} stoppedDueToDisconnect=${summary.stoppedDueToDisconnect}`
+    );
+    const snapshot = computeCoverageStatus();
+    log(
+      `📊 Coverage: direct=${snapshot.directCoveragePct.toFixed(0)}% (${snapshot.directChatsAtBaseline}/${snapshot.directChatsTotal}) groups=${snapshot.includeGroups ? `${snapshot.groupCoveragePct.toFixed(0)}% (${snapshot.groupChatsAtBaseline}/${snapshot.groupChatsTotal})` : 'n/a'} targets=${snapshot.pendingTargetsCount}`
+    );
+    lastCoverageFillAt = Date.now();
+    return;
+  }
+
+  if (backfillLock.holder) {
+    summary.skippedDueToLock = 1;
+    log('📈 Coverage fill: SKIP (lock held)');
+    log(
+      `📈 Coverage fill: chatsChecked=${summary.chatsChecked} chatsBackfilled=${summary.chatsBackfilled} messagesFetched=${summary.messagesFetched} skippedDueToLock=${summary.skippedDueToLock} stoppedDueToDisconnect=${summary.stoppedDueToDisconnect}`
+    );
+    const snapshot = computeCoverageStatus();
+    log(
+      `📊 Coverage: direct=${snapshot.directCoveragePct.toFixed(0)}% (${snapshot.directChatsAtBaseline}/${snapshot.directChatsTotal}) groups=${snapshot.includeGroups ? `${snapshot.groupCoveragePct.toFixed(0)}% (${snapshot.groupChatsAtBaseline}/${snapshot.groupChatsTotal})` : 'n/a'} targets=${snapshot.pendingTargetsCount}`
+    );
+    lastCoverageFillAt = Date.now();
+    return;
+  }
+
+  try {
+    await withBackfillLock('coverage-fill', async () => {
+      if (status.state !== 'connected') {
+        markDisconnected();
+        return;
+      }
+
+      let eligibleCount = 0;
+      let totalSaved = 0;
+      let processedChats = 0;
+
+      let chats: Chat[] = [];
+      try {
+        chats = await client.getChats();
+      } catch (err: any) {
+        log(`⚠️ Coverage fill: unable to fetch chats: ${err?.message}`);
+        return;
+      }
+
+      const eligible = chats
+        .filter((c: Chat) => {
+          if (resolvedChatName(c) === 'WhatsApp') return false;
+          if (c.id?._serialized === 'status@broadcast') return false;
+          if (c.isGroup && !COVERAGE_INCLUDE_GROUPS) return false;
+          return true;
+        })
+        .sort((a, b) => (a.id?._serialized || '').localeCompare(b.id?._serialized || ''));
+
+      eligibleCount = eligible.length;
+      if (eligibleCount === 0) return;
+
+      const ordered = [
+        ...eligible.slice(coverageFillIndex),
+        ...eligible.slice(0, coverageFillIndex)
+      ];
+
+      for (const chat of ordered) {
+        if (status.state !== 'connected') {
+          markDisconnected();
+          break;
+        }
+        if (totalSaved >= MAX_BACKFILL_MESSAGES_PER_RUN) break;
+        if (processedChats >= MAX_BACKFILL_CHATS_PER_RUN) break;
+
+        const chatId = chat.id?._serialized;
+        if (!chatId) continue;
+
+        summary.chatsChecked += 1;
+        let cursor = getCursorMeta(chatId);
+        if (cursor?.backfillExhausted) continue;
+
+        const targetFloor = chat.isGroup ? GROUP_BASELINE_MESSAGES : DIRECT_BASELINE_MESSAGES;
+        let storedCount =
+          (db as any).getMessageCount?.(chatId) ??
+          ((db as any).getMessagesByChat?.(chatId, targetFloor) || []).length;
+        if (storedCount >= targetFloor) continue;
+
+        processedChats += 1;
+        summary.chatsBackfilled += 1;
+        let remaining = targetFloor - storedCount;
+
+        while (remaining > 0 && totalSaved < MAX_BACKFILL_MESSAGES_PER_RUN) {
+          if (status.state !== 'connected') {
+            markDisconnected();
+            break;
+          }
+
+          const cutoffTs =
+            cursor?.oldestTs ??
+            (db as any).getOldestMessage?.(chatId)?.ts ??
+            Date.now();
+
+          const batchLimit = Math.min(
+            BACKFILL_BATCH,
+            remaining,
+            MAX_BACKFILL_MESSAGES_PER_RUN - totalSaved
+          );
+          if (batchLimit <= 0) break;
+
+          let messages: Message[] = [];
+          let oldestTsMs: number | null = null;
+          try {
+            const res = await fetchMessagesOlderThan(chatId, cutoffTs, batchLimit);
+            messages = res.messages;
+            oldestTsMs = res.oldestTsMs;
+          } catch (err: any) {
+            log(`⚠️ Coverage fill fetch error for ${resolvedChatName(chat)}: ${err?.message}`);
+            break;
+          }
+
+          summary.messagesFetched += messages.length;
+
+          let dupes = 0;
+          const newSaved: Message[] = [];
+          for (const m of messages) {
+            const msgId = (m as any).id?._serialized || (m as any).id?.id || (m as any).id;
+            if (msgId && (db as any).hasMessage?.(msgId)) {
+              dupes += 1;
+              continue;
+            }
+            await saveMessage(m, chat);
+            newSaved.push(m);
+          }
+
+          storedCount += newSaved.length;
+          remaining = Math.max(0, targetFloor - storedCount);
+          totalSaved += newSaved.length;
+
+          const dupRate = messages.length ? dupes / messages.length : 0;
+          const exhausted = messages.length === 0 || (oldestTsMs !== null && oldestTsMs >= cutoffTs);
+          const stalled = dupRate > 0.8 || exhausted;
+
+          updateCursorAfterBatch(chatId, { savedMessages: newSaved, dupes, exhausted });
+          cursor = getCursorMeta(chatId);
+
+          if (stalled) break;
+          await new Promise(resolve => setTimeout(resolve, BACKFILL_DELAY_BETWEEN_CHATS_MS));
+        }
+
+        if (summary.stoppedDueToDisconnect) break;
+        if (totalSaved >= MAX_BACKFILL_MESSAGES_PER_RUN) break;
+        await new Promise(resolve => setTimeout(resolve, BACKFILL_DELAY_BETWEEN_CHATS_MS));
+      }
+
+      if (eligibleCount > 0) {
+        const advanceBy = summary.chatsChecked % eligibleCount;
+        coverageFillIndex = (coverageFillIndex + advanceBy) % eligibleCount;
+      }
+    });
+  } catch (err: any) {
+    log(`⚠️ Coverage fill error: ${err?.message}`);
+  } finally {
+    log(
+      `📈 Coverage fill: chatsChecked=${summary.chatsChecked} chatsBackfilled=${summary.chatsBackfilled} messagesFetched=${summary.messagesFetched} skippedDueToLock=${summary.skippedDueToLock} stoppedDueToDisconnect=${summary.stoppedDueToDisconnect}`
+    );
+    const snapshot = computeCoverageStatus();
+    log(
+      `📊 Coverage: direct=${snapshot.directCoveragePct.toFixed(0)}% (${snapshot.directChatsAtBaseline}/${snapshot.directChatsTotal}) groups=${snapshot.includeGroups ? `${snapshot.groupCoveragePct.toFixed(0)}% (${snapshot.groupChatsAtBaseline}/${snapshot.groupChatsTotal})` : 'n/a'} targets=${snapshot.pendingTargetsCount}`
+    );
+    lastCoverageFillAt = Date.now();
+  }
+}
+
+function scheduleCoverageFill() {
+  if (coverageFillScheduled) return;
+  coverageFillScheduled = true;
   setInterval(() => {
-    slowFillTick();
-  }, SLOW_FILL_INTERVAL_MS);
+    coverageFillTick();
+  }, COVERAGE_FILL_INTERVAL_MS);
+}
+
+/* ===========================
+   Lightweight metadata hydrate
+   - Run after ready to improve contact/chat names without backfill
+=========================== */
+async function hydrateContactsAndChats() {
+  try {
+    const contacts = await client.getContacts();
+    for (const c of contacts) {
+      const contactId = (c as any).id?._serialized || c.id || c.number;
+      if (!contactId) continue;
+      const candidate = c.name || c.pushname || contactId;
+      const existing = (db as any).getContacts?.().find((x: any) => x.id === contactId);
+      const displayName = preferBestName(existing?.displayName, candidate, `hydrate-contact:${contactId}`) || candidate;
+      const savedName = c.name ?? existing?.savedName ?? null;
+      const pushname = c.pushname ?? existing?.pushname ?? null;
+      if ((db as any).updateContact) {
+        (db as any).updateContact({
+          id: contactId,
+          displayName,
+          savedName,
+          pushname
+        });
+      }
+    }
+
+    const chats = await client.getChats();
+    for (const chat of chats) {
+      const chatId = chat.id?._serialized;
+      if (!chatId) continue;
+      const preferredChatName = preferBestName(
+        (db as any).getChats?.().find((c: any) => c.id === chatId)?.name,
+        resolvedChatName(chat),
+        `hydrate-chat:${chatId}`
+      ) || resolvedChatName(chat);
+      if ((db as any).updateChatName) {
+        (db as any).updateChatName(chatId, preferredChatName);
+      }
+    }
+
+    if (process.env.DEBUG_INTEL) {
+      log(`DEBUG_INTEL: Hydrated contacts=${contacts.length} chats=${(await client.getChats()).length}`);
+    }
+  } catch (err: any) {
+    if (process.env.DEBUG_INTEL) {
+      log(`DEBUG_INTEL: Hydrate failed: ${err?.message}`);
+    }
+  }
 }
 /* ===========================
    Smart Backfill worker
@@ -1455,19 +1947,21 @@ async function smartBackfill() {
       );
 
       const now = Date.now();
-      const candidates: Array<{
-        chat: Chat;
-        score: number;
-        target: number;
+  const forcedTargets = meta.backfillTargets || {};
+  const candidates: Array<{
+    chat: Chat;
+    score: number;
+    target: number;
         existingCount: number;
         missingCount: number;
         cutoffTs: number;
         pinned: boolean;
-      }> = [];
+        forcedTarget?: number;
+  }> = [];
 
-      for (const chat of eligibleChats) {
-        try {
-          const chatId = chat.id._serialized;
+  for (const chat of eligibleChats) {
+    try {
+      const chatId = chat.id._serialized;
           const cursor = getCursorMeta(chatId);
           if (cursor?.backfillExhausted) {
             continue;
@@ -1477,36 +1971,56 @@ async function smartBackfill() {
           const latestTs = latest?.ts ?? null;
           const count24h = (db as any).getMessageCountSince?.(chatId, now - 24 * 60 * 60 * 1000) || 0;
           const count7d = (db as any).getMessageCountSince?.(chatId, now - 7 * 24 * 60 * 60 * 1000) || 0;
-          const keywordBoost = computeKeywordBoost(chatId);
-          const pinned = isPinnedChat(chat);
+      const keywordBoost = computeKeywordBoost(chatId);
+      const pinned = isPinnedChat(chat);
 
-          const recencyScore = latestTs
-            ? Math.max(0, 1 - (now - latestTs) / (14 * 24 * 60 * 60 * 1000)) * 70
-            : 0;
-          const activityScore = count24h * 5 + count7d * 1;
-          const score = recencyScore + activityScore + keywordBoost + (pinned ? 40 : 0);
+      const forcedTargetVal = forcedTargets[chatId];
+      const recencyScore = latestTs
+        ? Math.max(0, 1 - (now - latestTs) / (14 * 24 * 60 * 60 * 1000)) * 70
+        : 0;
+      const activityScore = count24h * 5 + count7d * 1;
+      const score = recencyScore + activityScore + keywordBoost + (pinned ? 40 : 0);
 
-          const target = computeTargetForScore(score, pinned);
-          const existingCount =
-            (db as any).getMessageCount?.(chatId) ??
-            ((db as any).getMessagesByChat(chatId, target) || []).length;
-          const missingCount = target - existingCount;
-          if (missingCount <= 0) continue;
+      const target = forcedTargetVal
+        ? Math.min(Math.max(forcedTargetVal, 1), MAX_TARGET_MESSAGES)
+        : pinned
+          ? Math.min(Math.max(PRIORITY_TARGET_MESSAGES, 1), MAX_TARGET_MESSAGES)
+          : chat.isGroup
+            ? Math.min(GROUP_BASELINE_MESSAGES, MAX_TARGET_MESSAGES)
+            : Math.min(DIRECT_CONTEXT_MESSAGES, MAX_TARGET_MESSAGES);
+
+      const existingCount =
+        (db as any).getMessageCount?.(chatId) ??
+        ((db as any).getMessagesByChat(chatId, target) || []).length;
+      const missingCount = target - existingCount;
+      if (missingCount <= 0) {
+        if (forcedTargetVal) {
+          log(`🎯 Backfill target reached ${resolvedChatName(chat)} target=${target} existing=${existingCount}`);
+          delete forcedTargets[chatId];
+          meta.backfillTargets = forcedTargets;
+          persistMeta();
+        }
+        continue;
+      }
 
           const cutoffTs =
             cursor?.oldestTs ??
             (db as any).getOldestMessage?.(chatId)?.ts ??
             Date.now();
 
-          candidates.push({
-            chat,
-            score,
-            target,
-            existingCount,
-            missingCount,
-            cutoffTs,
-            pinned
-          });
+      candidates.push({
+        chat,
+        score,
+        target,
+        existingCount,
+        missingCount,
+        cutoffTs,
+        pinned,
+        forcedTarget: forcedTargetVal ? target : undefined
+      });
+      if (forcedTargetVal) {
+        log(`🎯 Backfill target applied ${resolvedChatName(chat)} target=${target} existing=${existingCount}`);
+      }
         } catch (err: any) {
           log(`⚠️ Skipping chat ${resolvedChatName(chat)} due to scoring error: ${err?.message}`);
         }
@@ -1525,12 +2039,19 @@ async function smartBackfill() {
         return;
       }
 
-      candidates.sort((a, b) => b.score - a.score);
+      const priorityCandidates = candidates.filter(c => c.forcedTarget !== undefined);
+      const pinnedCandidates = candidates.filter(c => c.forcedTarget === undefined && c.pinned);
+      const normalCandidates = candidates.filter(c => c.forcedTarget === undefined && !c.pinned);
+
+      priorityCandidates.sort((a, b) => b.target - a.target);
+      pinnedCandidates.sort((a, b) => b.score - a.score);
+      normalCandidates.sort((a, b) => b.score - a.score);
+      const orderedCandidates = [...priorityCandidates, ...pinnedCandidates, ...normalCandidates];
 
       let processedCount = 0;
       let totalSaved = 0;
 
-      for (const candidate of candidates) {
+      for (const candidate of orderedCandidates) {
         if (processedCount >= MAX_BACKFILL_CHATS_PER_RUN) break;
         if (totalSaved >= MAX_BACKFILL_MESSAGES_PER_RUN) break;
 
@@ -1590,7 +2111,7 @@ async function smartBackfill() {
           lastRunAt: Date.now(),
           lastRunSaved: (meta.lastBackfillRun?.lastRunSaved || 0) + newSaved.length,
           lastRunChats: (meta.lastBackfillRun?.lastRunChats || 0) + 1,
-          queuedCandidates: meta.lastBackfillRun?.queuedCandidates || candidates.length
+          queuedCandidates: meta.lastBackfillRun?.queuedCandidates || orderedCandidates.length
         };
         persistMeta();
 
@@ -1601,6 +2122,16 @@ async function smartBackfill() {
         );
         if (stalled) {
           log(`⚠️ Pagination not advancing for ${resolvedChatName(chat)}; stopping this chat`);
+        }
+
+        const postCount =
+          (db as any).getMessageCount?.(chat.id._serialized) ??
+          ((db as any).getMessagesByChat(chat.id._serialized, candidate.target) || []).length;
+        if (candidate.forcedTarget && postCount >= candidate.target) {
+          log(`🎯 Backfill target reached ${resolvedChatName(chat)} target=${candidate.target} existing=${postCount}`);
+          delete forcedTargets[chat.id._serialized];
+          meta.backfillTargets = forcedTargets;
+          persistMeta();
         }
 
         processedCount += 1;
@@ -1625,6 +2156,8 @@ async function smartBackfill() {
         name: err?.name,
         timestamp: new Date().toISOString()
       });
+    } finally {
+      lastSmartBackfillAt = Date.now();
     }
   });
 }
@@ -1689,8 +2222,9 @@ function setupEventHandlers(c: any) {
     log('✅ WhatsApp client is ready!');
     try {
       await bootstrap();
+      await hydrateContactsAndChats(); // improve names early without backfill
       await runOnboardingBackfill();
-      scheduleSlowFill();
+      scheduleCoverageFill();
       scheduleSmartBackfill();
       // No more immediate backfill - smart backfill starts after 15 minutes
     } catch (err: any) {
