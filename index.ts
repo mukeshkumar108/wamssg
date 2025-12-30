@@ -44,6 +44,8 @@ const COVERAGE_FILL_INTERVAL_MS = +(process.env.COVERAGE_FILL_INTERVAL_MS || 30 
 const MAX_TARGET_MESSAGES = +(process.env.MAX_TARGET_MESSAGES || 500);
 const ALLOW_MANUAL_TARGET_OVERRIDE = (process.env.ALLOW_MANUAL_TARGET_OVERRIDE || 'false').toLowerCase() === 'true';
 const MANUAL_MAX_TARGET_MESSAGES = +(process.env.MANUAL_MAX_TARGET_MESSAGES || 1000);
+const ALLOW_MANUAL_BACKFILL_RUN = (process.env.ALLOW_MANUAL_BACKFILL_RUN || 'false').toLowerCase() === 'true';
+const BACKFILL_EXHAUSTION_BUDGET = Math.max(+(process.env.BACKFILL_EXHAUSTION_BUDGET || 3), 1);
 const DIRECT_BASELINE_MESSAGES = +(process.env.DIRECT_BASELINE_MESSAGES || 50);
 const DIRECT_CONTEXT_MESSAGES = +(process.env.DIRECT_CONTEXT_MESSAGES || 100);
 const GROUP_BASELINE_MESSAGES = +(process.env.GROUP_BASELINE_MESSAGES || 30);
@@ -133,6 +135,12 @@ type ChatCursorMeta = {
   backfillExhausted?: boolean;
   lastBackfillNewSaved?: number;
   lastBackfillDupes?: number;
+  lastAttemptAt?: number;
+  lastAttemptResult?: 'ok' | 'empty' | 'stalled' | 'error';
+  stallCount?: number;
+  exhaustedReason?: string;
+  lastFetchedOldestTs?: number | null;
+  lastFetchedOldestMessageId?: string | null;
 };
 
 type MetaState = {
@@ -142,6 +150,8 @@ type MetaState = {
     lastRunSaved?: number;
     lastRunChats?: number;
     queuedCandidates?: number;
+    skippedDueToExhaustedCount?: number;
+    eligibleTargetsCount?: number;
     targetsConsumedLastRun?: Array<{ chatId: string; targetMessages: number; beforeCount: number; afterCount: number }>;
   };
   onboardingCompleted?: boolean;
@@ -207,9 +217,29 @@ function getCursorMeta(chatId: string): ChatCursorMeta | undefined {
   return meta.chatCursors[chatId];
 }
 
-function updateCursorAfterBatch(chatId: string, opts: { savedMessages: Message[]; dupes: number; exhausted: boolean }) {
+function isCursorExhausted(cursor?: ChatCursorMeta): boolean {
+  if (!cursor?.backfillExhausted) return false;
+  return (cursor.stallCount || 0) >= BACKFILL_EXHAUSTION_BUDGET;
+}
+
+function updateCursorAfterBatch(
+  chatId: string,
+  opts: {
+    savedMessages: Message[];
+    dupes: number;
+    exhausted: boolean;
+    fetchedCount?: number;
+    fetchedOldestTs?: number | null;
+    cutoffTs?: number;
+    stalled?: boolean;
+    error?: string | null;
+    progressed?: boolean;
+    exhaustedReason?: string;
+    forcedReset?: boolean;
+  }
+) {
   const saved = opts.savedMessages || [];
-  const oldest = saved.reduce<{ ts?: number; id?: string }>((acc, m) => {
+  const oldestSaved = saved.reduce<{ ts?: number; id?: string }>((acc, m) => {
     const ts = (m.timestamp || 0) * 1000;
     if (acc.ts === undefined || ts < (acc.ts || 0)) {
       return { ts, id: (m.id as any)?._serialized || m.id?.id || m.id };
@@ -218,20 +248,68 @@ function updateCursorAfterBatch(chatId: string, opts: { savedMessages: Message[]
   }, {});
 
   const existing = meta.chatCursors[chatId] || {};
+  const now = Date.now();
+  const previousOldest = existing.oldestTs ?? null;
+  const fetchedOldestTs = opts.fetchedOldestTs ?? oldestSaved.ts ?? null;
+  const progressed =
+    opts.progressed ??
+    (oldestSaved.ts !== undefined && (previousOldest === null || oldestSaved.ts < previousOldest));
+
+  let stallCount = opts.forcedReset ? 0 : existing.stallCount || 0;
+  let backfillExhausted = opts.forcedReset ? false : existing.backfillExhausted || false;
+  let exhaustedReason = opts.forcedReset ? undefined : existing.exhaustedReason;
+  let attemptResult: ChatCursorMeta['lastAttemptResult'] = 'ok';
+
+  if (opts.error) {
+    attemptResult = 'error';
+  } else if (progressed) {
+    attemptResult = 'ok';
+  } else if (opts.exhausted || opts.stalled) {
+    attemptResult = opts.exhausted && saved.length === 0 ? 'empty' : 'stalled';
+  } else if ((opts.fetchedCount || 0) === 0 && saved.length === 0) {
+    attemptResult = 'empty';
+  }
+
+  if (progressed) {
+    stallCount = 0;
+    backfillExhausted = false;
+    exhaustedReason = undefined;
+  } else if (!opts.error && (opts.exhausted || opts.stalled)) {
+    const sameOldest =
+      fetchedOldestTs !== null &&
+      fetchedOldestTs !== undefined &&
+      (fetchedOldestTs === (existing.lastFetchedOldestTs ?? null) ||
+        fetchedOldestTs === (existing.oldestTs ?? null));
+    if (opts.exhausted || opts.stalled || sameOldest) {
+      stallCount += 1;
+    }
+    if (
+      status.state === 'connected' &&
+      (opts.exhausted || sameOldest) &&
+      stallCount >= BACKFILL_EXHAUSTION_BUDGET
+    ) {
+      backfillExhausted = true;
+      exhaustedReason =
+        opts.exhaustedReason ||
+        (opts.exhausted && saved.length === 0 ? 'no_older_pages' : 'cutoff_not_advancing');
+    }
+  }
+
   const next: ChatCursorMeta = {
     ...existing,
-    oldestTs: oldest.ts ?? existing.oldestTs,
-    oldestMessageId: oldest.id ?? existing.oldestMessageId,
-    lastBackfillAt: Date.now(),
-    backfillExhausted: opts.exhausted || false,
+    oldestTs: oldestSaved.ts ?? existing.oldestTs,
+    oldestMessageId: oldestSaved.id ?? existing.oldestMessageId,
+    lastBackfillAt: now,
+    backfillExhausted,
     lastBackfillNewSaved: saved.length,
-    lastBackfillDupes: opts.dupes
+    lastBackfillDupes: opts.dupes,
+    lastAttemptAt: now,
+    lastAttemptResult: attemptResult,
+    stallCount,
+    exhaustedReason,
+    lastFetchedOldestTs: fetchedOldestTs ?? existing.lastFetchedOldestTs ?? null,
+    lastFetchedOldestMessageId: oldestSaved.id ?? existing.lastFetchedOldestMessageId ?? null
   };
-
-  // If we actually moved the cursor, backfillExhausted should reset
-  if (saved.length > 0 && oldest.ts !== undefined) {
-    next.backfillExhausted = opts.exhausted;
-  }
 
   meta.chatCursors[chatId] = next;
   persistMeta();
@@ -385,16 +463,16 @@ function startHTTPServer() {
     const apiKey = process.env.API_KEY;
 
     if (!apiKey) {
-      return res.status(500).json({ error: 'API key not configured' });
+      return res.status(500).json({ ok: false, error: 'API key not configured' });
     }
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Missing or invalid authorization header' });
+      return res.status(401).json({ ok: false, error: 'Missing or invalid authorization header' });
     }
 
     const token = authHeader.substring(7);
     if (token !== apiKey) {
-      return res.status(401).json({ error: 'Invalid API key' });
+      return res.status(401).json({ ok: false, error: 'Invalid API key' });
     }
 
     next();
@@ -474,11 +552,14 @@ function startHTTPServer() {
         lastRunAt: meta.lastBackfillRun?.lastRunAt || null,
         lastRunSaved: meta.lastBackfillRun?.lastRunSaved || 0,
         lastRunChats: meta.lastBackfillRun?.lastRunChats || 0,
-        queuedCandidates: meta.lastBackfillRun?.queuedCandidates || 0
+        queuedCandidates: meta.lastBackfillRun?.queuedCandidates || 0,
+        skippedDueToExhaustedCount: meta.lastBackfillRun?.skippedDueToExhaustedCount || 0,
+        eligibleTargetsCount: meta.lastBackfillRun?.eligibleTargetsCount || 0,
+        pendingTargetsCount: listBackfillTargets().length
       },
       cursorStats: {
         totalTracked: Object.keys(meta.chatCursors || {}).length,
-        exhausted: Object.values(meta.chatCursors || {}).filter(c => c.backfillExhausted).length
+        exhausted: Object.values(meta.chatCursors || {}).filter(c => isCursorExhausted(c)).length
       }
     });
   });
@@ -949,7 +1030,11 @@ function startHTTPServer() {
       res.json({
         pendingTargetsCount: listBackfillTargets().length,
         targetsConsumedLastRun: meta.lastBackfillRun?.targetsConsumedLastRun || [],
-        lastSmartBackfillAt
+        queuedCandidates: meta.lastBackfillRun?.queuedCandidates || 0,
+        skippedDueToExhaustedCount: meta.lastBackfillRun?.skippedDueToExhaustedCount || 0,
+        eligibleTargetsCount: meta.lastBackfillRun?.eligibleTargetsCount || 0,
+        lastSmartBackfillAt,
+        manualBackfillRunEnabled: ALLOW_MANUAL_BACKFILL_RUN || process.env.NODE_ENV !== 'production'
       });
     } catch (err: any) {
       log('❌ API Error /api/backfill/summary:', err?.message);
@@ -995,6 +1080,7 @@ function startHTTPServer() {
           MAX_TARGET_MESSAGES,
           MANUAL_MAX_TARGET_MESSAGES,
           ALLOW_MANUAL_TARGET_OVERRIDE,
+          ALLOW_MANUAL_BACKFILL_RUN,
           COVERAGE_FILL_INTERVAL_MS,
           COVERAGE_INCLUDE_GROUPS,
           PINNED_CHAT_IDS_COUNT: PINNED_CHAT_IDS.length,
@@ -1010,6 +1096,7 @@ function startHTTPServer() {
           groupChatsTotal,
           messagesTotalStored: stats.messages || 0,
           mutexLocked: !!backfillLock.holder,
+          manualBackfillRunEnabled: ALLOW_MANUAL_BACKFILL_RUN || process.env.NODE_ENV !== 'production',
           startupInfillStatus: status.startupInfillStatus,
           startupInfillStartedAt: status.startupInfillStartedAt,
           startupInfillFinishedAt: status.startupInfillFinishedAt,
@@ -1037,6 +1124,10 @@ function startHTTPServer() {
         return res.json({ ok: true, ran: 'coverage' });
       }
       if (mode === 'smart') {
+        const manualEnabled = ALLOW_MANUAL_BACKFILL_RUN || process.env.NODE_ENV !== 'production';
+        if (!manualEnabled) {
+          return res.status(404).json({ error: 'disabled_in_production' });
+        }
         if (status.state !== 'connected') {
           return res.status(409).json({ error: 'disconnected' });
         }
@@ -1324,6 +1415,62 @@ return { messages, oldestTsMs };
 }
 
 /* ===========================
+   Safe greedy message fetch (manual backfill)
+   - Repeatedly pages older history, ignoring dup stalls
+=========================== */
+async function getMessagesSafe(chat: Chat, targetLimit: number): Promise<Message[]> {
+  const hardLimit = Math.max(1, targetLimit);
+  const batchSize = Math.min(Math.max(1, targetLimit), 200);
+  const byId = new Map<string, Message>();
+
+  const addMessages = (msgs: Message[]) => {
+    for (const m of msgs) {
+      const id = (m as any).id?._serialized || (m as any).id?.id || (m as any).id;
+      if (!id) continue;
+      if (!byId.has(id)) byId.set(id, m);
+    }
+  };
+
+  const sortMessages = () =>
+    Array.from(byId.values()).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+
+  let initial: Message[] = [];
+  try {
+    initial = await chat.fetchMessages({ limit: batchSize });
+  } catch (err: any) {
+    log(`⚠️ getMessagesSafe initial fetch failed for ${resolvedChatName(chat)}: ${err?.message}`);
+    return [];
+  }
+  addMessages(initial);
+
+  let loops = 0;
+  while (byId.size < hardLimit && loops < 50) {
+    const sorted = sortMessages();
+    const oldest = sorted[0];
+    if (!oldest) break;
+    const oldestId =
+      (oldest as any).id?._serialized || (oldest as any).id?.id || (oldest as any).id;
+    if (!oldestId) break;
+
+    let more: Message[] = [];
+    try {
+      more = await chat.fetchMessages({ limit: batchSize, before: oldestId } as any); // before is supported at runtime; cast to bypass TS type
+    } catch (err: any) {
+      log(`⚠️ getMessagesSafe fetch error for ${resolvedChatName(chat)}: ${err?.message}`);
+      break;
+    }
+
+    addMessages(more);
+    loops += 1;
+
+    if (more.length === 0) break; // hit start of history
+    if (byId.size >= hardLimit) break;
+  }
+
+  return sortMessages().slice(-hardLimit);
+}
+
+/* ===========================
    Targeted backfill helper
    - Used for onboarding + slow fill
 =========================== */
@@ -1335,7 +1482,7 @@ async function backfillChatToTarget(chat: Chat, target: number, totals: { saved:
   const existingCount = (db as any).getMessageCount?.(chatId) ?? ((db as any).getMessagesByChat(chatId, target) || []).length;
   if (existingCount >= target) return;
   const cursor = getCursorMeta(chatId);
-  if (cursor?.backfillExhausted) return;
+  if (isCursorExhausted(cursor)) return;
   let remaining = target - existingCount;
 
   while (remaining > 0 && totals.saved < MAX_BACKFILL_MESSAGES_PER_RUN) {
@@ -1359,6 +1506,16 @@ async function backfillChatToTarget(chat: Chat, target: number, totals: { saved:
       oldestTsMs = res.oldestTsMs;
     } catch (err: any) {
       log(`⚠️ Targeted backfill fetch error for ${resolvedChatName(chat)}: ${err?.message}`);
+      updateCursorAfterBatch(chatId, {
+        savedMessages: [],
+        dupes: 0,
+        exhausted: false,
+        fetchedCount: 0,
+        fetchedOldestTs: null,
+        cutoffTs,
+        stalled: false,
+        error: err?.message || 'fetch_error'
+      });
       break;
     }
 
@@ -1380,7 +1537,16 @@ async function backfillChatToTarget(chat: Chat, target: number, totals: { saved:
     const exhausted = messages.length === 0 || (oldestTsMs !== null && oldestTsMs >= cutoffTs);
     const stalled = dupRate > 0.8 || exhausted;
 
-    updateCursorAfterBatch(chatId, { savedMessages: newSaved, dupes, exhausted });
+    updateCursorAfterBatch(chatId, {
+      savedMessages: newSaved,
+      dupes,
+      exhausted,
+      fetchedCount: messages.length,
+      fetchedOldestTs: oldestTsMs,
+      cutoffTs,
+      stalled,
+      exhaustedReason: exhausted ? (messages.length === 0 ? 'no_older_pages' : 'cutoff_not_advancing') : undefined
+    });
 
     if (process.env.DEBUG_INTEL) {
       log(`DEBUG_INTEL: Targeted backfill stats chat=${chatId} fetched=${messages.length} saved=${newSaved.length} dupes=${dupes} dupRate=${(dupRate*100).toFixed(1)}% exhausted=${exhausted} stalled=${stalled} cursor=${getCursorMeta(chatId)?.oldestTs || 'n/a'}`);
@@ -1970,7 +2136,7 @@ async function coverageFillTick() {
 
         summary.chatsChecked += 1;
         let cursor = getCursorMeta(chatId);
-        if (cursor?.backfillExhausted) continue;
+        if (isCursorExhausted(cursor)) continue;
 
         const targetFloor = chat.isGroup ? GROUP_BASELINE_MESSAGES : DIRECT_BASELINE_MESSAGES;
         let storedCount =
@@ -2008,6 +2174,16 @@ async function coverageFillTick() {
             oldestTsMs = res.oldestTsMs;
           } catch (err: any) {
             log(`⚠️ Coverage fill fetch error for ${resolvedChatName(chat)}: ${err?.message}`);
+            updateCursorAfterBatch(chatId, {
+              savedMessages: [],
+              dupes: 0,
+              exhausted: false,
+              fetchedCount: 0,
+              fetchedOldestTs: null,
+              cutoffTs,
+              stalled: false,
+              error: err?.message || 'fetch_error'
+            });
             break;
           }
 
@@ -2033,7 +2209,16 @@ async function coverageFillTick() {
           const exhausted = messages.length === 0 || (oldestTsMs !== null && oldestTsMs >= cutoffTs);
           const stalled = dupRate > 0.8 || exhausted;
 
-          updateCursorAfterBatch(chatId, { savedMessages: newSaved, dupes, exhausted });
+          updateCursorAfterBatch(chatId, {
+            savedMessages: newSaved,
+            dupes,
+            exhausted,
+            fetchedCount: messages.length,
+            fetchedOldestTs: oldestTsMs,
+            cutoffTs,
+            stalled,
+            exhaustedReason: exhausted ? (messages.length === 0 ? 'no_older_pages' : 'cutoff_not_advancing') : undefined
+          });
           cursor = getCursorMeta(chatId);
 
           if (stalled) break;
@@ -2160,6 +2345,10 @@ async function smartBackfill() {
       const now = Date.now();
       const forcedTargets = meta.backfillTargets || {};
       const targetsConsumedThisRun: Array<{ chatId: string; targetMessages: number; beforeCount: number; afterCount: number }> = [];
+      const pendingTargetEntries = listBackfillTargets();
+      const eligibleTargetChats = new Set<string>();
+      let skippedDueToExhaustedCount = 0;
+      let eligibleTargetsCount = 0;
       const candidates: Array<{
         chat: Chat;
         score: number;
@@ -2175,10 +2364,7 @@ async function smartBackfill() {
       for (const chat of eligibleChats) {
         try {
           const chatId = chat.id._serialized;
-          const cursor = getCursorMeta(chatId);
-          if (cursor?.backfillExhausted) {
-            continue;
-          }
+          let cursor = getCursorMeta(chatId);
 
           const latest = (db as any).getLatestMessage?.(chatId);
           const latestTs = latest?.ts ?? null;
@@ -2225,6 +2411,27 @@ async function smartBackfill() {
             continue;
           }
 
+          const hasPendingForcedTarget = !!forcedTargetVal && missingCount > 0;
+          if (isCursorExhausted(cursor)) {
+            if (hasPendingForcedTarget) {
+              cursor = {
+                ...(cursor || {}),
+                backfillExhausted: false,
+                exhaustedReason: undefined,
+                stallCount: 0
+              };
+              meta.chatCursors[chatId] = cursor;
+              persistMeta();
+            } else {
+              skippedDueToExhaustedCount += 1;
+              continue;
+            }
+          }
+          if (hasPendingForcedTarget) {
+            eligibleTargetChats.add(chatId);
+            eligibleTargetsCount = eligibleTargetChats.size;
+          }
+
           const cutoffTs =
             cursor?.oldestTs ??
             (db as any).getOldestMessage?.(chatId)?.ts ??
@@ -2249,17 +2456,81 @@ async function smartBackfill() {
         }
       }
 
+      for (const entry of pendingTargetEntries) {
+        if (eligibleTargetChats.has(entry.chatId)) continue;
+        const existingCount = (db as any).getMessageCount?.(entry.chatId) || 0;
+        if (existingCount < entry.target) {
+          eligibleTargetChats.add(entry.chatId);
+        }
+      }
+      eligibleTargetsCount = eligibleTargetChats.size;
+
+      if (candidates.length === 0 && pendingTargetEntries.length > 0) {
+        const fallbackTargets = pendingTargetEntries.slice(0, MAX_BACKFILL_CHATS_PER_RUN);
+        for (const entry of fallbackTargets) {
+          try {
+            let chat = eligibleChats.find((c: Chat) => c.id._serialized === entry.chatId);
+            if (!chat) {
+              try {
+                chat = await client.getChatById(entry.chatId);
+              } catch {
+                continue;
+              }
+            }
+            if (!chat) continue;
+            const cap = entry.manual && ALLOW_MANUAL_TARGET_OVERRIDE ? MANUAL_MAX_TARGET_MESSAGES : MAX_TARGET_MESSAGES;
+            const target = Math.min(Math.max(entry.target, 1), cap);
+            const existingCount =
+              (db as any).getMessageCount?.(entry.chatId) ??
+              ((db as any).getMessagesByChat(entry.chatId, target) || []).length;
+            if (existingCount >= target) continue;
+            const cursor = getCursorMeta(entry.chatId);
+            if (isCursorExhausted(cursor)) {
+              meta.chatCursors[entry.chatId] = {
+                ...(cursor || {}),
+                backfillExhausted: false,
+                exhaustedReason: undefined,
+                stallCount: 0
+              };
+              persistMeta();
+            }
+            const cutoffTs =
+              cursor?.oldestTs ??
+              (db as any).getOldestMessage?.(entry.chatId)?.ts ??
+              Date.now();
+            const missingCount = target - existingCount;
+            candidates.push({
+              chat,
+              score: 1_000 + missingCount,
+              target,
+              existingCount,
+              missingCount,
+              cutoffTs,
+              pinned: false,
+              forcedTarget: target,
+              manual: entry.manual
+            });
+            eligibleTargetChats.add(entry.chatId);
+          } catch (err: any) {
+            log(`⚠️ Fallback target candidate failed for ${entry.chatId}: ${err?.message}`);
+          }
+        }
+        eligibleTargetsCount = eligibleTargetChats.size;
+      }
+
       meta.lastBackfillRun = {
         lastRunAt: Date.now(),
         lastRunSaved: 0,
         lastRunChats: 0,
-        queuedCandidates: candidates.length
+        queuedCandidates: candidates.length,
+        skippedDueToExhaustedCount,
+        eligibleTargetsCount
       };
       persistMeta();
 
       if (candidates.length === 0) {
-        log(`🔄 Smart backfill: nothing to do (no eligible candidates)`);
-        result.reason = 'no_candidates';
+        log(`🔄 Smart backfill: nothing to do (no eligible candidates) pendingTargets=${eligibleTargetsCount} skippedDueToExhausted=${skippedDueToExhaustedCount}`);
+        result.reason = eligibleTargetsCount > 0 ? 'pending_targets_no_candidates' : 'no_candidates';
         result.remainingTargetsCount = listBackfillTargets().length;
         return result;
       }
@@ -2282,11 +2553,8 @@ async function smartBackfill() {
         if (totalSaved >= MAX_BACKFILL_MESSAGES_PER_RUN) break;
 
         const { chat, target, existingCount, missingCount } = candidate;
-        const batchLimit = Math.min(
-          BACKFILL_BATCH,
-          missingCount,
-          MAX_BACKFILL_MESSAGES_PER_RUN - totalSaved
-        );
+        const remainingBudget = MAX_BACKFILL_MESSAGES_PER_RUN - totalSaved;
+        const batchLimit = Math.min(BACKFILL_BATCH, missingCount, remainingBudget);
         if (batchLimit <= 0) continue;
 
         const cutoffTs = candidate.cutoffTs || Date.now();
@@ -2302,13 +2570,32 @@ async function smartBackfill() {
         let messages: Message[] = [];
         let oldestTsMs: number | null = null;
         try {
-          const res = await fetchMessagesOlderThan(chat.id._serialized, cutoffTs, batchLimit);
-          messages = res.messages;
-          oldestTsMs = res.oldestTsMs;
+          if (candidate.manual) {
+            // Manual targets: aggressively page without stall detection
+            const safeLimit = Math.min(target, remainingBudget);
+            messages = await getMessagesSafe(chat, safeLimit);
+            oldestTsMs = messages.length
+              ? Math.min(...messages.map(m => (m.timestamp || 0) * 1000))
+              : null;
+          } else {
+            const res = await fetchMessagesOlderThan(chat.id._serialized, cutoffTs, batchLimit);
+            messages = res.messages;
+            oldestTsMs = res.oldestTsMs;
+          }
         } catch (chatErr: any) {
           log(
             `⚠️ Skipping chat ${resolvedChatName(chat)} due to fetch error: ${chatErr?.message}`
           );
+          updateCursorAfterBatch(chat.id._serialized, {
+            savedMessages: [],
+            dupes: 0,
+            exhausted: false,
+            fetchedCount: 0,
+            fetchedOldestTs: null,
+            cutoffTs,
+            stalled: false,
+            error: chatErr?.message || 'fetch_error'
+          });
           continue;
         }
 
@@ -2327,24 +2614,43 @@ async function smartBackfill() {
 
         totalSaved += newSaved.length;
         const dupRate = messages.length ? dupes / messages.length : 0;
-        const exhausted = messages.length === 0 || (oldestTsMs !== null && oldestTsMs >= cutoffTs);
+        const exhausted =
+          messages.length === 0 ||
+          (!candidate.manual && oldestTsMs !== null && oldestTsMs >= cutoffTs);
         if (exhausted) exhaustedCount += 1;
-        const stalled = dupRate > 0.8 || exhausted;
+        const stalled = candidate.manual ? false : dupRate > 0.8 || exhausted;
         let stallReason = '';
-        if (exhausted) stallReason = messages.length === 0 ? 'no_older_pages' : 'cutoff_reached';
+        if (exhausted) stallReason = messages.length === 0 ? 'no_older_pages' : 'cutoff_not_advancing';
         else if (dupRate > 0.8) stallReason = 'stalled_dup_rate';
+
+        const postCount =
+          (db as any).getMessageCount?.(chat.id._serialized) ??
+          ((db as any).getMessagesByChat(chat.id._serialized, candidate.target) || []).length;
+        const postOldest = (db as any).getOldestMessage?.(chat.id._serialized) || null;
+        const postOldestTs = postOldest?.ts ?? beforeOldestTs;
+        const progressed =
+          (postOldestTs !== null && (beforeOldestTs === null || postOldestTs < beforeOldestTs)) ||
+          postCount > existingCount;
 
         updateCursorAfterBatch(chat.id._serialized, {
           savedMessages: newSaved,
           dupes,
-          exhausted
+          exhausted,
+          fetchedCount: messages.length,
+          fetchedOldestTs: oldestTsMs,
+          cutoffTs,
+          stalled,
+          progressed,
+          exhaustedReason: stallReason || undefined
         });
 
         meta.lastBackfillRun = {
           lastRunAt: Date.now(),
           lastRunSaved: (meta.lastBackfillRun?.lastRunSaved || 0) + newSaved.length,
           lastRunChats: (meta.lastBackfillRun?.lastRunChats || 0) + 1,
-          queuedCandidates: meta.lastBackfillRun?.queuedCandidates || orderedCandidates.length
+          queuedCandidates: meta.lastBackfillRun?.queuedCandidates || orderedCandidates.length,
+          skippedDueToExhaustedCount: meta.lastBackfillRun?.skippedDueToExhaustedCount ?? skippedDueToExhaustedCount,
+          eligibleTargetsCount: meta.lastBackfillRun?.eligibleTargetsCount ?? eligibleTargetsCount
         };
         persistMeta();
 
@@ -2356,15 +2662,6 @@ async function smartBackfill() {
         if (stalled) {
           log(`⚠️ Pagination not advancing for ${resolvedChatName(chat)}; stopping this chat`);
         }
-
-        const postCount =
-          (db as any).getMessageCount?.(chat.id._serialized) ??
-          ((db as any).getMessagesByChat(chat.id._serialized, candidate.target) || []).length;
-        const postOldest = (db as any).getOldestMessage?.(chat.id._serialized) || null;
-        const postOldestTs = postOldest?.ts ?? beforeOldestTs;
-        const progressed =
-          (postOldestTs !== null && (beforeOldestTs === null || postOldestTs < beforeOldestTs)) ||
-          postCount > existingCount;
 
         if (!progressed) {
           log(
